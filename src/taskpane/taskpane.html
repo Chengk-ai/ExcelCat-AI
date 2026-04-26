@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ExcelCat AI – Excel Task Pane</title>
+
+  <!-- Office.js -->
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,400&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="taskpane.css" />
+</head>
+
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header id="header">
+    <div class="logo-mark" title="ExcelCat AI">
+      <img src="../../assets/cat-head.png" alt="ExcelCat AI" />
+    </div>
+    <div class="header-title">
+      <h1> ExcelCat</h1>
+      <span>AI spreadsheet agent</span>
+    </div>
+    <div class="header-actions">
+      <!-- Audit toggle: persists in localStorage. When ON the backend writes
+           audit.jsonl + audit.md; when OFF nothing is recorded.
+           Uses data-tip (CSS tooltip below the button) instead of title to
+           avoid the native tooltip overlapping nearby header text. -->
+      <button class="icon-btn audit-toggle has-tip" id="btn-audit" aria-label="Audit trail: ON" data-tip="Audit trail: ON">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M3 2h7l3 3v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"/>
+          <path d="M10 2v3h3"/>
+          <path d="M5 9h6M5 11.5h4"/>
+        </svg>
+        <span class="audit-dot" id="audit-dot" aria-hidden="true"></span>
+      </button>
+      <!-- Download audit: renders audit.jsonl → audit.md on demand and downloads. -->
+      <button class="icon-btn has-tip" id="btn-audit-download" aria-label="Download audit trail" data-tip="Download audit trail">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M8 2v8M5 7l3 3 3-3"/>
+          <path d="M3 12h10v1H3z"/>
+        </svg>
+      </button>
+      <!-- Clear audit: deletes audit.jsonl + audit.md on backend. -->
+      <button class="icon-btn has-tip" id="btn-audit-clear" aria-label="Clear audit trail" data-tip="Clear audit trail">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M3 2h7l3 3v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"/>
+          <path d="M10 2v3h3"/>
+          <path d="M5.5 9.5l5 3M10.5 9.5l-5 3"/>
+        </svg>
+      </button>
+      <!-- Clear chat -->
+      <button class="icon-btn has-tip" id="btn-clear" aria-label="Clear conversation" data-tip="Clear conversation">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M3 4h10M6 4V3h4v1M5 4l.5 9h5l.5-9"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+<!-- Quick actions -->
+<div id="quick-actions">
+  <div class="qa-label">Quick Actions</div>
+  <div class="qa-chips">
+
+    <div class="chip" data-prompt="Summarise the selected data">
+      Summarise Data
+    </div>
+
+    <div class="chip" data-prompt="Find outliers and anomalies in the selected data">
+      Find Outliers
+    </div>
+
+    <div class="chip" data-prompt="Clean and standardise the selected data">
+      Clean Data
+    </div>
+
+    <div class="chip" data-prompt="Write a one paragraph plain English analysis of the selected data">
+      Analyse Data
+    </div>
+
+    <div class="chip" data-prompt="Create a chart for the selected data">
+      Chart It
+    </div>
+
+  </div>
+</div>
+
+  <!-- Verification Layer Panel -->
+  <div class="panel" id="panel-verify">
+    <div class="panel-header">
+      <div class="panel-dot"></div>
+      <div class="panel-title">Verification Layer</div>
+      <div class="panel-badge" id="verify-count" style="color:#a78bfa;border-color:rgba(167,139,250,0.25);background:rgba(167,139,250,0.08)">0 checks</div>
+      <div class="panel-chevron">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M4 6l4 4 4-4"/>
+        </svg>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="panel-inner">
+        <div class="verify-log" id="verify-log">
+          <div class="verify-empty" id="verify-empty">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M8 2l1.5 3 3.5.5-2.5 2.5.5 3.5L8 10l-3 1.5.5-3.5L3 5.5 6.5 5z"/>
+            </svg>
+            No checks yet. Verification entries will appear here as the AI proposes actions.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Messages -->
+  <div id="messages">
+    <div id="empty-state">
+      <div class="empty-icon"><img src="../../assets/cat-head.png" alt="" /></div>
+      <h2>What can I help with?</h2>
+      <p>Ask me to analyse data, write formulas, clean cells, or anything else in your spreadsheet.</p>
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div id="input-area">
+    <div class="selection-pill" id="selection-pill">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <rect x="2" y="2" width="12" height="12" rx="2"/>
+        <path d="M5 8h6"/>
+      </svg>
+      <span id="selection-label">Selection: A1:B10</span>
+      <button class="clear-sel" id="clear-sel" title="Remove context">×</button>
+    </div>
+    <div class="textarea-wrap">
+      <textarea id="chat-input" rows="1" placeholder="Ask anything about your spreadsheet…"></textarea>
+      <button id="send-btn" title="Send (Enter)">
+        <svg viewBox="0 0 16 16" fill="currentColor">
+          <path d="M2.5 13.5l11-5.5-11-5.5v4.4l7 1.1-7 1.1z"/>
+        </svg>
+      </button>
+    </div>
+    <div class="input-footer">
+      <span class="input-hint">Enter ↵ send · Shift+Enter new line</span>
+      <select id="model-select" class="model-select" title="Select model">
+        <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
+        <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+      </select>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
