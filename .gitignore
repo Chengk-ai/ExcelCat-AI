@@ -5,3 +5,7 @@ node_modules/
 audit.jsonl
 audit.md
 .DS_Store
+.obsidian/
+.claude/
+.vscode/
+CLAUDE.md
