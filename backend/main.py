@@ -16,6 +16,12 @@ from google.genai import types
 
 import audit
 import audit_render
+from rules import RULES, RULES_REVIEW
+from rules.base import ReviewContext
+from rules.financial.param_locator import locate_all, IS_PERCENTAGE
+from rules.financial.row_classifier import count_inspectable_cells
+from rules.financial.horizontal_formula_consistency import MIN_DATA_CELLS
+from rules.financial.hardcode_trend_anomaly import MIN_VALUES
 
 # ── Config ────────────────────────────────────────────────
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -648,8 +654,21 @@ async def pre_write_hook(
                     "reason": _first_critique(review_meta["log"]),
                 })
 
-    # ── Check 2: Data Integrity (to be added) ──
-    # e.g. when write_to_cell, check whether it breaks debit/credit balance
+    # ── Check 2: Data Integrity (deterministic rules) ──
+    for rule in RULES:
+        if rule.applies_to(tool_call["name"]):
+            results = rule.check(tool_call, context)
+            for r in results:
+                checks_run.append(r.rule_id)
+                if r.level == "warning":
+                    warnings.append(r.message)
+                elif r.level == "suggestion":
+                    suggestions.append({
+                        "field": "value",
+                        "original": tool_call.get("args", {}).get("value", ""),
+                        "suggested": "",
+                        "reason": r.message,
+                    })
 
     # ── Check 3: Financial Logic (to be added) ──
     # e.g. is WACC within a reasonable 5%–15% range
@@ -920,6 +939,7 @@ class SelectionContext(BaseModel):
     address: str
     sheet: str
     values: List[List[Any]]
+    formulas: List[List[Any]] = []
     rowCount: int
     columnCount: int
 
@@ -939,6 +959,14 @@ class AuditDecisionRequest(BaseModel):
     tool_index: int
     decision: Literal["approve", "use_ai", "reject", "reject_retry", "failed"]
     reason: Optional[str] = None
+    audit_enabled: Optional[bool] = True
+
+
+class ReviewRequest(BaseModel):
+    """On-demand review: user selects a region and triggers assumption checks."""
+    values: List[List[Any]]
+    formulas: List[List[Any]] = []
+    address: str = ""
     audit_enabled: Optional[bool] = True
 
 # ── Main endpoint ─────────────────────────────────────────
@@ -1281,3 +1309,133 @@ async def audit_clear():
     """Wipe audit.jsonl and audit.md. The user owns their audit history."""
     removed = audit.clear()
     return {"ok": True, "removed": removed}
+
+
+# ── Review Layer (on-demand, read-only assumption checks) ──────────────────────
+_REVIEW_PARAM_LABELS = {
+    "wacc": "WACC",
+    "tgr": "TGR",
+    "tax": "Tax rate",
+    "beta": "Beta",
+    "debt_weight": "% Debt",
+    "equity_weight": "% Equity",
+}
+
+
+def _fmt_review_pct(v: float) -> str:
+    """Format a decimal-scale value as a percentage, trimming trailing zeros."""
+    s = f"{v * 100:.2f}".rstrip("0").rstrip(".")
+    return f"{s}%"
+
+
+def _fmt_review_value(param_key: str, v: float) -> str:
+    """Format a located value for display — percentage or plain decimal."""
+    if IS_PERCENTAGE.get(param_key, True):
+        return _fmt_review_pct(v)
+    return f"{v:.2f}"
+
+
+@app.post("/review")
+async def review_endpoint(request: ReviewRequest):
+    """
+    Run RULES_REVIEW against the user's selected region. Read-only — never
+    modifies cells. Returns a report the frontend renders as a static card.
+    """
+    audit_enabled = bool(request.audit_enabled)
+    request_id = str(uuid.uuid4())
+
+    review_ctx = ReviewContext(
+        values=request.values,
+        formulas=request.formulas,
+        address=request.address,
+    )
+
+    located = {}
+    for key, label in _REVIEW_PARAM_LABELS.items():
+        found = locate_all(key, request.values, request.address)
+        if found:
+            located[label] = [
+                {"value": _fmt_review_value(key, p.value), "cell": p.cell}
+                for p in found
+            ]
+
+    # Proof-of-work for the row-level rules: count how many data cells of each
+    # kind actually cleared the inspection bar. Counting cells (not rows) lets
+    # a mixed row's formula and hardcode segments both show up. Without this, a
+    # clean trend row looks identical to "we didn't even look" — same ambiguity
+    # v1 hit with param locator.
+    inspected_cells = count_inspectable_cells(
+        request.formulas, MIN_DATA_CELLS, MIN_VALUES
+    )
+
+    results = []
+    for rule in RULES_REVIEW:
+        results.extend(rule.check(review_ctx))
+
+    # Sort warnings before suggestions, with rule_id as a stable tiebreak so
+    # the frontend doesn't need its own sort. Same finding always renders in
+    # the same place across runs — important for audit-trail consistency too.
+    _LEVEL_ORDER = {"warning": 0, "suggestion": 1}
+    results.sort(key=lambda r: (_LEVEL_ORDER.get(r.level, 99), r.rule_id))
+
+    warnings = [r for r in results if r.level == "warning"]
+    suggestions = [r for r in results if r.level == "suggestion"]
+
+    def _fmt_located_group(label, entries):
+        vals = ", ".join(
+            f"{e['value']} at {e['cell']}" if e.get("cell") else e["value"]
+            for e in entries
+        )
+        return f"{label} ({vals})"
+
+    def _fmt_cell_inspection() -> str:
+        parts = []
+        for kind in ("formula", "hardcode"):
+            n = inspected_cells[kind]
+            if n:
+                parts.append(f"{n} {kind} cell{'s' if n != 1 else ''}")
+        return ", ".join(parts)
+
+    checked_parts = [_fmt_located_group(k, v) for k, v in located.items()]
+    row_summary = _fmt_cell_inspection()
+    if row_summary:
+        checked_parts.append(f"scanned {row_summary}")
+    inspected_anything = bool(located) or bool(row_summary)
+
+    if not inspected_anything:
+        summary = "Nothing reviewable in this selection (no assumptions, no data rows)."
+    elif not results:
+        summary = f"Checked {', '.join(checked_parts)}. No issues found."
+    else:
+        parts = []
+        if warnings:
+            parts.append(f"{len(warnings)} warning{'s' if len(warnings) != 1 else ''}")
+        if suggestions:
+            parts.append(f"{len(suggestions)} suggestion{'s' if len(suggestions) != 1 else ''}")
+        summary = f"Review complete: {', '.join(parts)}."
+
+    payload = {
+        "address": request.address,
+        "located": located,
+        "inspected_cells": inspected_cells,
+        "results": [
+            {"rule_id": r.rule_id, "level": r.level, "message": r.message}
+            for r in results
+        ],
+        "summary": summary,
+    }
+
+    audit.append_event(
+        "review_run",
+        payload,
+        request_id=request_id,
+        enabled=audit_enabled,
+    )
+
+    return {
+        "request_id": request_id,
+        "located": located,
+        "inspected_cells": inspected_cells,
+        "results": payload["results"],
+        "summary": summary,
+    }

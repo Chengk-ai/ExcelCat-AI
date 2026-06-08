@@ -997,3 +997,108 @@ html, body {
 .approval-card.resolved .approval-card-resolution { display: block; }
 .approval-card-resolution.approved { color: var(--accent2); background: rgba(34,197,94,0.09); }
 .approval-card-resolution.rejected { color: var(--text-muted); background: var(--surface); }
+
+/* ── Review Assumptions chip ── */
+.chip.chip-review {
+  border-color: rgba(167,139,250,0.35);
+  background: rgba(167,139,250,0.08);
+  color: #7c6bc4;
+}
+.chip.chip-review:hover {
+  border-color: rgba(167,139,250,0.6);
+  background: rgba(167,139,250,0.16);
+  color: #5b49a6;
+}
+
+/* ── Review Report Card (read-only) ── */
+.review-report {
+  margin-top: 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  animation: msgIn 0.2s ease-out;
+}
+.review-report-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+}
+.review-report-title {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: var(--text);
+}
+.review-report-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+.review-report-badge.clean      { color: var(--accent2); background: rgba(34,197,94,0.13); }
+.review-report-badge.has-issues { color: #f59e42; background: rgba(245,158,66,0.15); }
+.review-report-badge.none       { color: var(--text-muted); background: rgba(0,0,0,0.05); }
+
+.review-report-body {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* "Checked: WACC = 7.82% · Tax rate = 21%" — transparency chips showing
+   which assumptions were located and inspected. */
+.review-report-checked {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.review-checked-param {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text);
+  background: rgba(167,139,250,0.1);
+  border: 1px solid rgba(167,139,250,0.2);
+  border-radius: 4px;
+  padding: 1px 7px;
+}
+.review-report-item {
+  font-size: 11.5px;
+  line-height: 1.5;
+  border-left: 3px solid var(--border);
+  padding: 6px 10px;
+  border-radius: 0 6px 6px 0;
+  background: var(--surface);
+}
+.review-report-item.warning {
+  border-left-color: rgba(245,158,66,0.7);
+}
+.review-report-item.suggestion {
+  border-left-color: rgba(91,156,246,0.6);
+}
+.review-report-item-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 2px;
+}
+.review-report-item.warning .review-report-item-label    { color: #f59e42; }
+.review-report-item.suggestion .review-report-item-label { color: #5b9cf6; }
+.review-report-item-msg {
+  color: var(--text);
+}
+.review-report-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+}
