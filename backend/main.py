@@ -5,32 +5,78 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from typing import List, Optional, Any, Literal
-import asyncio
 import os
+import sys
 import re
 import json
 import uuid
-import httpx
-from google import genai
-from google.genai import types
+from contextlib import asynccontextmanager, AsyncExitStack
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 import audit
 import audit_render
-from rules import RULES, RULES_REVIEW
-from rules.base import ReviewContext
-from rules.financial.param_locator import locate_all, IS_PERCENTAGE
-from rules.financial.row_classifier import count_inspectable_cells
-from rules.financial.horizontal_formula_consistency import MIN_DATA_CELLS
-from rules.financial.hardcode_trend_anomaly import MIN_VALUES
+# LLM transport + tool registry now live in llm_client (shared with the
+# excelcat-verify MCP server, which runs the reflexion loop). main.py only needs
+# _call_model for the /chat passes and FORECAST_ONLY_TOOLS for the forecast pass.
+from llm_client import _call_model, FORECAST_ONLY_TOOLS
 
-# ── Config ────────────────────────────────────────────────
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+# ── MCP servers ───────────────────────────────────────────
+# The MCP refactor splits backend-owned logic into stdio MCP servers, spawned
+# once and held open for the app's lifetime. main.py stays the orchestrator and
+# keeps the audit chokepoint — servers never touch audit.
+#   - excelcat-verify : review_assumptions, check_rules, verify_formula
+#   - excelcat-skills : get_skill, list_skills (the skill contracts)
+_MCP_SERVERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_servers")
+_VERIFY_SERVER = os.path.join(_MCP_SERVERS_DIR, "verify_server.py")
+_SKILLS_SERVER = os.path.join(_MCP_SERVERS_DIR, "skills_server.py")
 
-gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    stack = AsyncExitStack()
+    app.state.mcp_verify = None
+    app.state.mcp_skills = None
+    # Skill-name routing sets, cached from the skills server at startup so the
+    # /chat hot path doesn't round-trip per request (and so the registry has a
+    # single source of truth — no copy in main.py to drift).
+    app.state.skill_text_names = set()
+    app.state.skill_action_names = set()
+
+    async def _connect(server_path: str, label: str):
+        # One server crashing must not take the API (or the other server) down;
+        # each capability degrades on its own (see endpoints for fail-loud paths).
+        params = StdioServerParameters(command=sys.executable, args=[server_path])
+        read, write = await stack.enter_async_context(stdio_client(params))
+        session = await stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        print(f"[MCP] {label} session initialised")
+        return session
+
+    try:
+        app.state.mcp_verify = await _connect(_VERIFY_SERVER, "excelcat-verify")
+    except Exception as e:
+        print(f"[MCP] failed to start excelcat-verify: {e}")
+
+    try:
+        app.state.mcp_skills = await _connect(_SKILLS_SERVER, "excelcat-skills")
+        listed = _unwrap_tool_result(await app.state.mcp_skills.call_tool("list_skills", {}))
+        app.state.skill_text_names = set(listed.get("text", []))
+        app.state.skill_action_names = set(listed.get("action", []))
+        print(f"[MCP] skills cached: text={sorted(app.state.skill_text_names)} "
+              f"action={sorted(app.state.skill_action_names)}")
+    except Exception as e:
+        print(f"[MCP] failed to start excelcat-skills: {e}")
+
+    try:
+        yield
+    finally:
+        await stack.aclose()
+        app.state.mcp_verify = None
+        app.state.mcp_skills = None
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,307 +86,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Skills loader ─────────────────────────────────────────
-SKILLS_DIR = os.path.join(os.path.dirname(__file__), "skills") # join the skills directory and the filename
+# ── Skills loader (via excelcat-skills MCP server) ────────────
+# The skill registry + markdown contracts now live in mcp_servers/skills_server.py.
+# main.py fetches content on demand and fails loud if the service is unavailable —
+# it does not silently answer without the skill contract.
+async def _load_skill_content(tool_name: str) -> Optional[str]:
+    """Fetch a skill's markdown from the excelcat-skills MCP server.
 
-SKILL_FILE_MAP = { 
-    "summarise_data": "summarise.md", 
-    "clean_data":     "clean_data.md",
-    "find_outliers":  "find_outliers.md",
-    "analyse_data":   "analyse_data.md",
-}
-
-def load_skill_by_tool(tool_name: str) -> Optional[str]:
-    """Load skill file content by function call name"""
-    filename = SKILL_FILE_MAP.get(tool_name) # get the filename from the map
-    if not filename:
-        return None
-    path = os.path.join(SKILLS_DIR, filename) # join the skills directory and the filename  
-    if os.path.exists(path): # if the path exists, read the file
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read() # return the file content
-    return None
-
-# ── Function calling Definitions ──────────────────────────────
-tools = types.Tool(
-    function_declarations=[
-
-        # ── Excel action tools ──
-        types.FunctionDeclaration(
-            name="write_to_cell",
-            description=(
-                "Write a value or formula to a specific Excel cell. "
-                "Use this when the user explicitly asks to write, insert, or put something into a cell."
-            ),
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "cell": types.Schema(type="STRING", description="Cell address e.g. A1, B3"),
-                    "value": types.Schema(type="STRING", description="Value or formula e.g. =SUM(A1:A10)"),
-                },
-                required=["cell", "value"]
-            )
-        ),
-
-        types.FunctionDeclaration(
-            name="create_chart",
-            description=(
-                "Create a chart from the currently selected Excel range. "
-                "Use this when the user explicitly asks to create, draw, or generate a chart or graph. "
-                "Choose the most appropriate chart type based on the data."
-            ),
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "chart_type": types.Schema(
-                        type="STRING",
-                        description="Chart type: ColumnClustered, Line, Pie, Bar, or Area"
-                    ),
-                    "title": types.Schema(type="STRING", description="Chart title"),
-                },
-                required=["chart_type"]
-            )
-        ),
-
-        # ── Skill tools (intent recognition) ──
-        types.FunctionDeclaration(
-            name="summarise_data",
-            description=(
-                "Summarise the selected Excel data with key insights, trends, and statistics. "
-                "Use ONLY when the user explicitly asks to summarise, analyse, or get an overview of the data. "
-                "Do NOT use if the user merely mentions the word 'summary' in passing."
-            ),
-        ),
-
-        types.FunctionDeclaration(
-            name="clean_data",
-            description=(
-                "Identify and fix data quality issues such as inconsistent formatting, blank cells, and duplicates. "
-                "Use ONLY when the user explicitly asks to clean, fix, or tidy the data. "
-                "Do NOT use if the user merely describes the data as 'clean'."
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="find_outliers",
-            description=(
-                "Identify anomalous or unusual values in the selected Excel data. "
-                "Use ONLY when the user explicitly asks to find outliers, anomalies, or unusual values. "
-                "Do NOT use when the user merely mentions the data looks 'unusual' in passing."
-            ),
-        ),
-
-        types.FunctionDeclaration(
-            name="analyse_data",
-            description=(
-                "Write a one-paragraph plain English analysis of the selected Excel data, "
-                "covering what the data shows, the most important trend, and a recommendation. "
-                "Use ONLY when the user explicitly asks to analyse the data or wants a written narrative. "
-                "Do NOT use for bullet-point summaries — that is summarise_data's job."
-            ),
-        ),
-    ]
-)
+    Returns the content, or None if the tool isn't a skill / its file is missing.
+    Raises RuntimeError if the skills service is unavailable (caller surfaces it).
+    """
+    session = getattr(app.state, "mcp_skills", None)
+    if session is None:
+        raise RuntimeError("skills service not running")
+    res = _unwrap_tool_result(await session.call_tool("get_skill", {"tool_name": tool_name}))
+    return res.get("content")
 
 
-def _build_openai_tools():
-    """Convert Gemini function declarations to OpenAI-compatible tools schema."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "write_to_cell",
-                "description": (
-                    "Write a value or formula to a specific Excel cell. "
-                    "Use this when the user explicitly asks to write, insert, or put something into a cell."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cell": {"type": "string", "description": "Cell address e.g. A1, B3"},
-                        "value": {"type": "string", "description": "Value or formula e.g. =SUM(A1:A10)"},
-                    },
-                    "required": ["cell", "value"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "create_chart",
-                "description": (
-                    "Create a chart from the currently selected Excel range. "
-                    "Use this when the user explicitly asks to create, draw, or generate a chart or graph. "
-                    "Choose the most appropriate chart type based on the data."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "chart_type": {
-                            "type": "string",
-                            "description": "Chart type: ColumnClustered, Line, Pie, Bar, or Area",
-                        },
-                        "title": {"type": "string", "description": "Chart title"},
-                    },
-                    "required": ["chart_type"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "summarise_data",
-                "description": (
-                    "Summarise the selected Excel data with key insights, trends, and statistics. "
-                    "Use ONLY when the user explicitly asks to summarise, analyse, or get an overview of the data. "
-                    "Do NOT use if the user merely mentions the word 'summary' in passing."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "clean_data",
-                "description": (
-                    "Identify and fix data quality issues such as inconsistent formatting, blank cells, and duplicates. "
-                    "Use ONLY when the user explicitly asks to clean, fix, or tidy the data. "
-                    "Do NOT use if the user merely describes the data as 'clean'."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "find_outliers",
-                "description": (
-                    "Identify anomalous or unusual values in the selected Excel data. "
-                    "Use ONLY when the user explicitly asks to find outliers, anomalies, or unusual values."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "analyse_data",
-                "description": (
-                    "Write a one-paragraph plain English analysis of the selected Excel data. "
-                    "Use ONLY when the user explicitly asks to analyse the data or wants a written narrative."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-    ]
-
-
-OPENAI_TOOLS = _build_openai_tools()
-
-
-async def _call_deepseek(
-    model: str,
-    user_content: str,
-    system_instruction: Optional[str] = None,
-    use_tools: bool = False,
-) -> dict:
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY is not configured in backend/.env")
-
-    messages = []
-    if system_instruction:
-        messages.append({"role": "system", "content": system_instruction})
-    messages.append({"role": "user", "content": user_content})
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.2,
+def _skills_unavailable_response(request_id: str, audit_enabled: bool) -> dict:
+    """Graceful /chat response when the skills service is down — honest, not silent."""
+    if audit_enabled:
+        audit.append_event(
+            "chat_response",
+            {"skill_used": False, "tool_calls_proposed": [], "reply_excerpt": "skills service unavailable", "error": True},
+            request_id=request_id,
+            enabled=audit_enabled,
+        )
+    return {
+        "reply": "The skills service is unavailable right now — please try again in a moment.",
+        "tool_calls": [],
+        "skill_used": False,
+        "review": None,
+        "request_id": request_id,
     }
-    if use_tools:
-        payload["tools"] = OPENAI_TOOLS
-        payload["tool_choice"] = "auto"
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        try:
-            resp = await client.post(
-                f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions",
-                json=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPStatusError as e:
-            body = e.response.text
-            raise RuntimeError(f"DeepSeek API error {e.response.status_code}: {body}") from e
+# ── Function calling + LLM transport moved to llm_client.py ──
+# The tool registry (OPENAI_TOOLS / tools / FORECAST_ONLY_TOOLS) and the
+# _call_deepseek / _call_model transport now live in llm_client.py, shared
+# with the excelcat-verify MCP server. Imported at the top of this file.
 
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-
-    text = message.get("content") or ""
-    parsed_tool_calls = []
-    for tc in message.get("tool_calls") or []:
-        fn = tc.get("function") or {}
-        raw_args = fn.get("arguments") or "{}"
-        try:
-            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-        except json.JSONDecodeError:
-            args = {}
-        parsed_tool_calls.append({
-            "name": fn.get("name", ""),
-            "args": args,
-        })
-
-    return {"text": text.strip(), "tool_calls": parsed_tool_calls}
-
-
-async def _call_model(
-    selected_model: str,
-    user_content: str,
-    system_instruction: Optional[str] = None,
-    use_tools: bool = False,
-) -> dict:
-    if selected_model == "deepseek-v4-flash":
-        return await _call_deepseek(
-            model=DEEPSEEK_MODEL,
-            user_content=user_content,
-            system_instruction=system_instruction,
-            use_tools=use_tools,
-        )
-
-    # Gemini SDK is synchronous — run in a thread so it doesn't block the
-    # event loop either. Same principle as the DeepSeek fix.
-    config = None
-    if system_instruction or use_tools:
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction if system_instruction else None,
-            tools=[tools] if use_tools else None,
-        )
-
-    def _gemini_sync():
-        return gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[user_content],
-            config=config,
-        )
-
-    response = await asyncio.to_thread(_gemini_sync)
-
-    parsed_tool_calls = []
-    text = ""
-    for part in response.parts:
-        if hasattr(part, "function_call") and part.function_call:
-            fc = part.function_call
-            parsed_tool_calls.append({
-                "name": fc.name,
-                "args": dict(fc.args) if fc.args else {}
-            })
-        elif hasattr(part, "text") and part.text:
-            text += part.text
-    return {"text": text.strip(), "tool_calls": parsed_tool_calls}
 
 # ── Reflexion Pattern (critique → revise → re-verify, up to 3×) ──────────────
 def contains_formula(text: str) -> bool: # check if the text contains a formula
@@ -397,110 +181,47 @@ async def reflexion_review(
     selected_model: str = "deepseek-v4-flash",
     request_id: Optional[str] = None,
     audit_enabled: bool = True,
-) -> dict: # review the original reply
+) -> dict:
     """
-    Reflexion loop:
-      Iteration 1: Critique → if wrong, Revise
-      Iteration 2: Re-verify revised → if wrong, Revise again
-      Iteration 3: Final re-verify
-    Returns:
-      {
-        "final_reply": str,    # best version after corrections
-        "verified": bool,      # True if passed final review
-        "iterations": int,     # how many loops ran
-        "log": list            # what happened each iteration
-      }
+    Thin client over the excelcat-verify MCP server's `verify_formula` tool,
+    which now runs the reflexion loop (critique → revise → re-verify, up to 3×).
 
-    Audit: when request_id is provided and audit_enabled is True, emits one
-    `reflexion_run` event at the end of the loop. The event's payload
-    includes the full critique chain so an auditor can replay every iteration
-    of the critic's reasoning.
+    The loop moved into the server (Phase 3 of the MCP refactor); this wrapper
+    keeps the audit chokepoint in main.py — it emits the single `reflexion_run`
+    event after the loop returns, with the full critique chain so an auditor can
+    replay every iteration.
+
+    Returns {final_reply, verified, iterations, log}. Fails loud: if the
+    verification service is unavailable, the original reply passes through
+    UNVERIFIED with the reason recorded in `log` — never silently "verified".
     """
-    current_reply = original_reply
-    log = []
-
-    for i in range(1, max_iterations + 1):
-        print(f"[REFLEXION] Iteration {i}/{max_iterations}")
-
-        # Step 1: Critique
-        critique_prompt = f"""You are a strict Excel formula auditor.
-        Review the following response and check every formula for correctness
-        AGAINST THE USER'S ACTUAL DATA STATE.
-
-        Response to review: {current_reply}
-        User's data context: {context_str}
-
-        Rules:
-        - Treat the "Data state observations" as ground truth. Do not assume
-          data exists if the observations say the selection is empty or
-          partially empty.
-        - If the formula references a range that is EMPTY according to the
-          observations, that IS an error — describe it (e.g. "SUM applied to
-          an empty range will return 0 and is likely unintended").
-        - If the formula uses a numeric function (SUM, AVERAGE, etc.) on a
-          range with NO numeric values, that IS an error.
-        - If ALL formulas pass these checks, reply with exactly: "✓ Verified"
-        - If ANY formula has an error, describe the error concisely and
-          nothing else. Do not rewrite the formula here — just describe what
-          is wrong."""
-         # create the critique prompt
-        critique = (await _call_model(selected_model, critique_prompt))["text"].strip()
-        print(f"[REFLEXION] Critique {i}: {critique}")
-
-        # Verified — stop loop early
-        if critique == "✓ Verified":
-            log.append({"iteration": i, "critique": "✓ Verified", "revised": False})
+    session = getattr(app.state, "mcp_verify", None)
+    if session is None:
+        result = {
+            "final_reply": original_reply,
+            "verified": False,
+            "iterations": 0,
+            "log": [{"error": "verification service not running"}],
+        }
+    else:
+        try:
+            result = _unwrap_tool_result(await session.call_tool(
+                "verify_formula",
+                {
+                    "original_reply": original_reply,
+                    "context_str": context_str,
+                    "max_iterations": max_iterations,
+                    "selected_model": selected_model,
+                },
+            ))
+        except Exception as e:
             result = {
-                "final_reply": current_reply,
-                "verified": True,
-                "iterations": i,
-                "log": log
+                "final_reply": original_reply,
+                "verified": False,
+                "iterations": 0,
+                "log": [{"error": f"verification service error: {e}"}],
             }
-            if request_id:
-                audit.append_event(
-                    "reflexion_run",
-                    {
-                        "original": original_reply,
-                        "final_reply": result["final_reply"],
-                        "verified": result["verified"],
-                        "iterations": result["iterations"],
-                        "log": result["log"],
-                    },
-                    request_id=request_id,
-                    enabled=audit_enabled,
-                )
-            return result
 
-        # Step 2: Revise (only if not last iteration)
-        if i < max_iterations:
-            revise_prompt = f"""You are an Excel formula expert.
-            The following response contains formula errors. Fix ONLY the formulas — keep all other text exactly the same.
-            Original response: {current_reply}
-            Error identified: {critique}
-            User's data context: {context_str}
-            Return the full corrected response. Do not add any explanation or preamble."""
-            # create the revise prompt
-            revised_reply = (await _call_model(selected_model, revise_prompt))["text"].strip()
-            print(f"[REFLEXION] Revised {i}: {revised_reply[:150]}")
-
-            log.append({
-                "iteration": i,
-                "critique": critique,
-                "revised": True,
-            })
-            current_reply = revised_reply
-        else:
-            # Last iteration, still not verified
-            log.append({"iteration": i, "critique": critique, "revised": False})
-
-    # Max iterations reached without verification
-    print(f"[REFLEXION] Max iterations reached, returning lastest version")
-    result = {
-        "final_reply": current_reply,
-        "verified": False,
-        "iterations": max_iterations,
-        "log": log
-    }
     if request_id:
         audit.append_event(
             "reflexion_run",
@@ -654,21 +375,66 @@ async def pre_write_hook(
                     "reason": _first_critique(review_meta["log"]),
                 })
 
-    # ── Check 2: Data Integrity (deterministic rules) ──
-    for rule in RULES:
-        if rule.applies_to(tool_call["name"]):
-            results = rule.check(tool_call, context)
-            for r in results:
-                checks_run.append(r.rule_id)
-                if r.level == "warning":
-                    warnings.append(r.message)
-                elif r.level == "suggestion":
-                    suggestions.append({
-                        "field": "value",
-                        "original": tool_call.get("args", {}).get("value", ""),
-                        "suggested": "",
-                        "reason": r.message,
-                    })
+    # ── Forecast batch: one structured action carrying N formulas. Run
+    # reflexion on a representative formula (the first) for correctness. The
+    # acceptance-range check comes from the deterministic rules below.
+    if tool_call["name"] == "apply_forecast":
+        args = tool_call.get("args", {})
+        values = args.get("values", []) or []
+        sample = values[0] if values else ""
+        if sample and contains_formula(sample):
+            checks_run.append("formula_correctness")
+            print(f"[HOOK] Running forecast check on sample: {sample}")
+            review_meta = await reflexion_review(
+                sample,
+                enriched_context,
+                selected_model=selected_model,
+                request_id=request_id,
+                audit_enabled=audit_enabled,
+            )
+            ai_version = _extract_formula(review_meta["final_reply"])
+            if not review_meta["verified"]:
+                warnings.append(
+                    f"Forecast formula did not pass verification after "
+                    f"{review_meta['iterations']} attempts — please review manually."
+                )
+            elif ai_version and _normalise_formula(ai_version) != _normalise_formula(sample):
+                suggestions.append({
+                    "field": "value",
+                    "original":  sample,
+                    "suggested": ai_version,
+                    "reason": _first_critique(review_meta["log"]),
+                })
+
+    # ── Check 2: Data Integrity (deterministic rules, via excelcat-verify MCP) ──
+    # The rules run in the MCP server (single source of truth). This sits on the
+    # audit chokepoint, so we fail loud, never silent: if the server is down we
+    # surface a warning AND record `rules_unavailable` in checks_run, so the
+    # approval card and the audit trail both show that integrity checks were
+    # degraded rather than pretending they passed.
+    ctx_payload = None
+    if context is not None:
+        ctx_payload = {
+            "values": getattr(context, "values", []),
+            "formulas": getattr(context, "formulas", []),
+            "address": getattr(context, "address", ""),
+        }
+    session = getattr(app.state, "mcp_verify", None)
+    if session is None:
+        warnings.append("Data-integrity rules could not run (verification service not running).")
+        checks_run.append("rules_unavailable")
+    else:
+        try:
+            rules_res = _unwrap_tool_result(await session.call_tool(
+                "check_rules",
+                {"tool_call": tool_call, "context": ctx_payload},
+            ))
+            warnings.extend(rules_res.get("warnings", []))
+            suggestions.extend(rules_res.get("suggestions", []))
+            checks_run.extend(rules_res.get("checks_run", []))
+        except Exception as e:
+            warnings.append(f"Data-integrity rules could not run (verification service error: {e}).")
+            checks_run.append("rules_unavailable")
 
     # ── Check 3: Financial Logic (to be added) ──
     # e.g. is WACC within a reasonable 5%–15% range
@@ -1030,9 +796,16 @@ async def chat_endpoint(request: ChatRequest):
         "TOOLS: Use tools only when the user explicitly requests an action. "
         "For summarise_data and clean_data, trigger them only on clear user intent — "
         "not just because the words appear in the message.\n"
+        "FORECAST: When the user asks to predict, forecast, or project future "
+        "values from a historical series (e.g. 'predict 2022–2026 from the "
+        "2017–2021 trend', 'forecast next year with 20% growth'), you MUST call "
+        "forecast_data — do NOT emit write_to_cell calls for forecasts. This "
+        "applies even when the forecast spans several cells; the FILL-DOWN rule "
+        "below does NOT apply to forecasts.\n"
         "FILL-DOWN: When the user asks to compute a value or formula for "
         "every row of a range (e.g. 'put A+B in column C', 'compute the "
-        "totals for column D', 'fill column E with =A*B'), you MUST emit "
+        "totals for column D', 'fill column E with =A*B') — but NOT a forecast "
+        "(see FORECAST above) — you MUST emit "
         "ONE write_to_cell call PER ROW of the target range. Do not emit a "
         "single formula and expect the user to drag it down — every cell "
         "must be written explicitly so each one is verified and audited. "
@@ -1078,10 +851,13 @@ async def chat_endpoint(request: ChatRequest):
         print(f"[DEBUG] Tool calls: {[t['name'] for t in tool_calls]}")
 
         # 5. Handle skill tools (summarise_data, clean_data)
-        skill_tool = next((t for t in tool_calls if t["name"] in SKILL_FILE_MAP), None)
+        skill_tool = next((t for t in tool_calls if t["name"] in app.state.skill_text_names), None)
 
         if skill_tool:
-            skill_content = load_skill_by_tool(skill_tool["name"])
+            try:
+                skill_content = await _load_skill_content(skill_tool["name"])
+            except RuntimeError:
+                return _skills_unavailable_response(request_id, audit_enabled)
             print(f"[DEBUG] Skill triggered: {skill_tool['name']}, file loaded: {skill_content is not None}")
 
             skill_prompt = base_prompt
@@ -1132,8 +908,43 @@ async def chat_endpoint(request: ChatRequest):
                 "request_id": request_id,
             }
 
-        # 6. Handle action tools (write_to_cell, create_chart)
-        action_tools = [t for t in tool_calls if t["name"] not in SKILL_FILE_MAP]
+        # 5b. Handle action-skill tools (forecast_data). Two-pass like skills,
+        # but the second pass produces a structured action (apply_forecast)
+        # under the loaded contract, then falls through to the action path so
+        # it goes through pre_write_hook and is shown as one approval card.
+        forecast_intent = next((t for t in tool_calls if t["name"] in app.state.skill_action_names), None)
+        if forecast_intent:
+            try:
+                skill_content = await _load_skill_content(forecast_intent["name"])
+            except RuntimeError:
+                return _skills_unavailable_response(request_id, audit_enabled)
+            print(f"[DEBUG] Action-skill triggered: {forecast_intent['name']}, file loaded: {skill_content is not None}")
+
+            forecast_prompt = base_prompt
+            if skill_content:
+                forecast_prompt += f"\n\n── SKILL INSTRUCTIONS (follow these precisely) ──\n{skill_content}"
+            forecast_prompt += (
+                "\n\nNow call apply_forecast exactly once: provide the target cells, "
+                "the formula for each cell (aligned with the cells), the method, a "
+                "one-sentence rationale, and the historical values you based the "
+                "forecast on."
+            )
+
+            forecast_pass = await _call_model(
+                selected_model=selected_model,
+                user_content=final_user_message,
+                system_instruction=forecast_prompt,
+                use_tools=True,
+                tools_override=FORECAST_ONLY_TOOLS,
+            )
+            # Replace tool_calls with the contracted second-pass result and fall
+            # through to the action path below.
+            tool_calls = forecast_pass["tool_calls"]
+            ai_text = forecast_pass["text"]
+            print(f"[DEBUG] Forecast pass tool calls: {[t['name'] for t in tool_calls]}")
+
+        # 6. Handle action tools (write_to_cell, create_chart, apply_forecast)
+        action_tools = [t for t in tool_calls if t["name"] not in app.state.skill_text_names]
 
         # Collapse same-column row-pattern writes into one apply_formula_pattern
         # tool_call so the user only confirms once for an N-row fill. Falls
@@ -1312,130 +1123,88 @@ async def audit_clear():
 
 
 # ── Review Layer (on-demand, read-only assumption checks) ──────────────────────
-_REVIEW_PARAM_LABELS = {
-    "wacc": "WACC",
-    "tgr": "TGR",
-    "tax": "Tax rate",
-    "beta": "Beta",
-    "debt_weight": "% Debt",
-    "equity_weight": "% Equity",
-}
+def _unwrap_tool_result(result) -> dict:
+    """Pull the structured dict out of an MCP CallToolResult.
 
-
-def _fmt_review_pct(v: float) -> str:
-    """Format a decimal-scale value as a percentage, trimming trailing zeros."""
-    s = f"{v * 100:.2f}".rstrip("0").rstrip(".")
-    return f"{s}%"
-
-
-def _fmt_review_value(param_key: str, v: float) -> str:
-    """Format a located value for display — percentage or plain decimal."""
-    if IS_PERCENTAGE.get(param_key, True):
-        return _fmt_review_pct(v)
-    return f"{v:.2f}"
+    The tool JSON-encodes its return into a text content block, so that's the
+    most version-stable source for an exact-shape payload. structuredContent is
+    used as a fallback.
+    """
+    for block in getattr(result, "content", []) or []:
+        text = getattr(block, "text", None)
+        if text:
+            return json.loads(text)
+    structured = getattr(result, "structuredContent", None)
+    if isinstance(structured, dict):
+        return structured
+    raise RuntimeError("empty MCP tool result")
 
 
 @app.post("/review")
 async def review_endpoint(request: ReviewRequest):
     """
     Run RULES_REVIEW against the user's selected region. Read-only — never
-    modifies cells. Returns a report the frontend renders as a static card.
+    modifies cells. The rule computation runs in the excelcat-verify MCP server;
+    this endpoint owns request_id generation and the audit chokepoint.
     """
     audit_enabled = bool(request.audit_enabled)
     request_id = str(uuid.uuid4())
 
-    review_ctx = ReviewContext(
-        values=request.values,
-        formulas=request.formulas,
-        address=request.address,
-    )
-
-    located = {}
-    for key, label in _REVIEW_PARAM_LABELS.items():
-        found = locate_all(key, request.values, request.address)
-        if found:
-            located[label] = [
-                {"value": _fmt_review_value(key, p.value), "cell": p.cell}
-                for p in found
-            ]
-
-    # Proof-of-work for the row-level rules: count how many data cells of each
-    # kind actually cleared the inspection bar. Counting cells (not rows) lets
-    # a mixed row's formula and hardcode segments both show up. Without this, a
-    # clean trend row looks identical to "we didn't even look" — same ambiguity
-    # v1 hit with param locator.
-    inspected_cells = count_inspectable_cells(
-        request.formulas, MIN_DATA_CELLS, MIN_VALUES
-    )
-
-    results = []
-    for rule in RULES_REVIEW:
-        results.extend(rule.check(review_ctx))
-
-    # Sort warnings before suggestions, with rule_id as a stable tiebreak so
-    # the frontend doesn't need its own sort. Same finding always renders in
-    # the same place across runs — important for audit-trail consistency too.
-    _LEVEL_ORDER = {"warning": 0, "suggestion": 1}
-    results.sort(key=lambda r: (_LEVEL_ORDER.get(r.level, 99), r.rule_id))
-
-    warnings = [r for r in results if r.level == "warning"]
-    suggestions = [r for r in results if r.level == "suggestion"]
-
-    def _fmt_located_group(label, entries):
-        vals = ", ".join(
-            f"{e['value']} at {e['cell']}" if e.get("cell") else e["value"]
-            for e in entries
+    def _finish(located, inspected_cells, results, summary, *, error=False) -> dict:
+        # Audit payload carries `address`; the frontend response keeps the
+        # original shape (no address). `error` is additive — only present when
+        # the verification service was unreachable.
+        payload = {
+            "address": request.address,
+            "located": located,
+            "inspected_cells": inspected_cells,
+            "results": results,
+            "summary": summary,
+        }
+        if error:
+            payload["error"] = True
+        audit.append_event(
+            "review_run", payload, request_id=request_id, enabled=audit_enabled
         )
-        return f"{label} ({vals})"
+        resp = {
+            "request_id": request_id,
+            "located": located,
+            "inspected_cells": inspected_cells,
+            "results": results,
+            "summary": summary,
+        }
+        if error:
+            resp["error"] = True
+        return resp
 
-    def _fmt_cell_inspection() -> str:
-        parts = []
-        for kind in ("formula", "hardcode"):
-            n = inspected_cells[kind]
-            if n:
-                parts.append(f"{n} {kind} cell{'s' if n != 1 else ''}")
-        return ", ".join(parts)
+    session = getattr(app.state, "mcp_verify", None)
+    if session is None:
+        return _finish(
+            {}, {}, [],
+            "Review is temporarily unavailable (verification service not running).",
+            error=True,
+        )
 
-    checked_parts = [_fmt_located_group(k, v) for k, v in located.items()]
-    row_summary = _fmt_cell_inspection()
-    if row_summary:
-        checked_parts.append(f"scanned {row_summary}")
-    inspected_anything = bool(located) or bool(row_summary)
+    try:
+        result = await session.call_tool(
+            "review_assumptions",
+            {
+                "values": request.values,
+                "formulas": request.formulas,
+                "address": request.address,
+            },
+        )
+        review = _unwrap_tool_result(result)
+    except Exception as e:
+        return _finish(
+            {}, {}, [],
+            f"Review is temporarily unavailable (verification call failed: {e}).",
+            error=True,
+        )
 
-    if not inspected_anything:
-        summary = "Nothing reviewable in this selection (no assumptions, no data rows)."
-    elif not results:
-        summary = f"Checked {', '.join(checked_parts)}. No issues found."
-    else:
-        parts = []
-        if warnings:
-            parts.append(f"{len(warnings)} warning{'s' if len(warnings) != 1 else ''}")
-        if suggestions:
-            parts.append(f"{len(suggestions)} suggestion{'s' if len(suggestions) != 1 else ''}")
-        summary = f"Review complete: {', '.join(parts)}."
-
-    payload = {
-        "address": request.address,
-        "located": located,
-        "inspected_cells": inspected_cells,
-        "results": [
-            {"rule_id": r.rule_id, "level": r.level, "message": r.message}
-            for r in results
-        ],
-        "summary": summary,
-    }
-
-    audit.append_event(
-        "review_run",
-        payload,
-        request_id=request_id,
-        enabled=audit_enabled,
+    return _finish(
+        review["located"],
+        review["inspected_cells"],
+        review["results"],
+        review["summary"],
     )
-
-    return {
-        "request_id": request_id,
-        "located": located,
-        "inspected_cells": inspected_cells,
-        "results": payload["results"],
-        "summary": summary,
-    }

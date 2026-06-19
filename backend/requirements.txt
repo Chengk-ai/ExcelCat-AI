@@ -1,0 +1,10 @@
+# ExcelCat AI backend dependencies.
+# Pin loosely — bump deliberately. The backend is run from this directory:
+#   uvicorn main:app --port 8000 --reload
+fastapi
+uvicorn
+pydantic
+httpx
+python-dotenv
+google-genai
+mcp
