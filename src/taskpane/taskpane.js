@@ -537,25 +537,40 @@ function renderApprovalCard(toolCall, approvalId) {
     description = `Write <code>${escapeHtml(toolCall.args.value)}</code> to cell <code>${escapeHtml(toolCall.args.cell)}</code>`;
   } else if (toolCall.name === 'create_chart') {
     description = `Create a <code>${escapeHtml(toolCall.args.chart_type)}</code> chart from the selected range`;
-  } else if (toolCall.name === 'apply_formula_pattern') {
+  } else if (toolCall.name === 'apply_formula_pattern' || toolCall.name === 'apply_forecast') {
     // Batch write — list every cell→value pair so the audit trail is
-    // visible even when the user approves with one click. Pattern shown
-    // up top for the "what's the same" answer.
+    // visible even when the user approves with one click.
     const a = toolCall.args || {};
     const cells = a.cells || [];
     const values = a.values || [];
     const rowsHtml = cells.map((c, k) =>
       `<div class="batch-row"><code class="batch-cell">${escapeHtml(c)}</code><span class="batch-arrow">←</span><code class="batch-value">${escapeHtml(values[k] ?? '')}</code></div>`
     ).join('');
-    description = `
-      <div class="batch-summary">
-        Apply pattern to <strong>${cells.length} cells</strong> (${escapeHtml(a.range || '')})
-      </div>
-      <div class="batch-pattern">
-        Pattern: <code>${escapeHtml(a.pattern || '')}</code>
-      </div>
-      <div class="batch-rows">${rowsHtml}</div>
-    `;
+    if (toolCall.name === 'apply_forecast') {
+      // Forecast batch — show the method and the audit rationale up top.
+      const rangeLabel = a.range || (cells.length ? `${cells[0]}–${cells[cells.length - 1]}` : '');
+      description = `
+        <div class="batch-summary">
+          Forecast <strong>${cells.length} cells</strong> (${escapeHtml(rangeLabel)})
+        </div>
+        <div class="batch-pattern">
+          Method: <code>${escapeHtml(a.method || 'n/a')}</code>
+        </div>
+        ${a.rationale ? `<div class="batch-pattern">Rationale: ${escapeHtml(a.rationale)}</div>` : ''}
+        <div class="batch-rows">${rowsHtml}</div>
+      `;
+    } else {
+      // Pattern shown up top for the "what's the same" answer.
+      description = `
+        <div class="batch-summary">
+          Apply pattern to <strong>${cells.length} cells</strong> (${escapeHtml(a.range || '')})
+        </div>
+        <div class="batch-pattern">
+          Pattern: <code>${escapeHtml(a.pattern || '')}</code>
+        </div>
+        <div class="batch-rows">${rowsHtml}</div>
+      `;
+    }
   } else {
     description = `Run <code>${escapeHtml(toolCall.name)}</code>`;
   }
@@ -571,7 +586,7 @@ function renderApprovalCard(toolCall, approvalId) {
   // - batch (apply_formula_pattern): never offer "Use AI's version" — the
   //   reflexion suggestion is on the sample formula and we'd need symbolic
   //   re-templating to apply it across N rows. Skipped intentionally.
-  const isBatch = toolCall.name === 'apply_formula_pattern';
+  const isBatch = toolCall.name === 'apply_formula_pattern' || toolCall.name === 'apply_forecast';
   let actionsHtml;
   if (status === 'suggestion' && suggestions.length > 0 && !isBatch) {
     actionsHtml = `
@@ -685,7 +700,7 @@ async function approveToolCall(approvalId) {
       await createNativeChart(tool.args.chart_type, tool.args.title || 'AI Generated Chart');
       markApprovalResolved(approvalId, 'approved', `✓ Created ${tool.args.chart_type} chart`, 'approved');
       postAuditDecision(tool.__requestId, tool.__toolIndex, 'approve');
-    } else if (tool.name === 'apply_formula_pattern') {
+    } else if (tool.name === 'apply_formula_pattern' || tool.name === 'apply_forecast') {
       // Batch write — loop and execute each cell→value. We do NOT roll
       // back on partial failure (Excel doesn't give us a clean tx). The
       // user gets a "Partial: K/N written" status with the failure detail.
@@ -702,9 +717,10 @@ async function approveToolCall(approvalId) {
           break;
         }
       }
+      const rangeLabel = tool.args.range || (cells.length ? `${cells[0]}–${cells[cells.length - 1]}` : '');
       if (!failure) {
         markApprovalResolved(approvalId, 'approved',
-          `✓ Wrote ${written} cells (${tool.args.range})`, 'approved');
+          `✓ Wrote ${written} cells (${rangeLabel})`, 'approved');
         postAuditDecision(tool.__requestId, tool.__toolIndex, 'approve',
           `wrote ${written} cells in batch`);
       } else {

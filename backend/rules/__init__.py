@@ -4,6 +4,7 @@ from .overwrite_referenced_cell import OverwriteReferencedCellRule
 from .date_format_check import DateFormatCheckRule
 from .email_format_check import EmailFormatCheckRule
 from .percentage_range_check import PercentageRangeCheckRule
+from .forecast_sanity import ForecastSanityRule
 from .financial import (
     TgrVsWaccRule,
     WaccRangeRule,
@@ -25,6 +26,8 @@ RULES = [
     DateFormatCheckRule(),
     EmailFormatCheckRule(),
     PercentageRangeCheckRule(),
+    # Type 3: forecast acceptance-range check
+    ForecastSanityRule(),
 ]
 
 RULES_REVIEW = [
