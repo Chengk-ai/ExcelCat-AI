@@ -28,7 +28,21 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# Gemini is the FALLBACK model, so a missing key must not stop DeepSeek-primary
+# operation — and this module is imported by main.py AND the MCP servers, so a
+# crash at import would take every capability down at once. The client is
+# created lazily on the first Gemini call and fails loud there instead.
+_gemini_client: Optional[genai.Client] = None
+
+
+def _get_gemini_client() -> genai.Client:
+    global _gemini_client
+    if _gemini_client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not configured in backend/.env")
+        _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
 
 
 # ── Function calling Definitions ──────────────────────────────
@@ -221,6 +235,12 @@ FORECAST_ONLY_TOOLS = {
 
 
 # ── Transport ─────────────────────────────────────────────
+# One shared client so every DeepSeek call reuses pooled connections instead of
+# paying a fresh TCP+TLS handshake — a single /chat round with reflexion can
+# make 5-8 sequential calls. Lives for the process lifetime; no explicit close.
+_http_client = httpx.AsyncClient(timeout=60)
+
+
 async def _call_deepseek(
     model: str,
     user_content: str,
@@ -246,21 +266,20 @@ async def _call_deepseek(
         payload["tools"] = tools_override or OPENAI_TOOLS
         payload["tool_choice"] = "auto"
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        try:
-            resp = await client.post(
-                f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions",
-                json=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPStatusError as e:
-            body = e.response.text
-            raise RuntimeError(f"DeepSeek API error {e.response.status_code}: {body}") from e
+    try:
+        resp = await _http_client.post(
+            f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions",
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except httpx.HTTPStatusError as e:
+        body = e.response.text
+        raise RuntimeError(f"DeepSeek API error {e.response.status_code}: {body}") from e
 
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -318,7 +337,7 @@ async def _call_model(
         )
 
     def _gemini_sync():
-        return gemini_client.models.generate_content(
+        return _get_gemini_client().models.generate_content(
             model=GEMINI_MODEL,
             contents=[user_content],
             config=config,

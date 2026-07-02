@@ -25,11 +25,13 @@ from llm_client import _call_model, FORECAST_ONLY_TOOLS
 # The MCP refactor splits backend-owned logic into stdio MCP servers, spawned
 # once and held open for the app's lifetime. main.py stays the orchestrator and
 # keeps the audit chokepoint — servers never touch audit.
-#   - excelcat-verify : review_assumptions, check_rules, verify_formula
-#   - excelcat-skills : get_skill, list_skills (the skill contracts)
+#   - excelcat-verify   : review_assumptions, check_rules, verify_formula
+#   - excelcat-skills   : get_skill, list_skills (the skill contracts)
+#   - excelcat-analysis : analyse_variance (deterministic compute + 2 LLM passes)
 _MCP_SERVERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_servers")
 _VERIFY_SERVER = os.path.join(_MCP_SERVERS_DIR, "verify_server.py")
 _SKILLS_SERVER = os.path.join(_MCP_SERVERS_DIR, "skills_server.py")
+_ANALYSIS_SERVER = os.path.join(_MCP_SERVERS_DIR, "analysis_server.py")
 
 
 @asynccontextmanager
@@ -37,6 +39,7 @@ async def lifespan(app: FastAPI):
     stack = AsyncExitStack()
     app.state.mcp_verify = None
     app.state.mcp_skills = None
+    app.state.mcp_analysis = None
     # Skill-name routing sets, cached from the skills server at startup so the
     # /chat hot path doesn't round-trip per request (and so the registry has a
     # single source of truth — no copy in main.py to drift).
@@ -69,18 +72,27 @@ async def lifespan(app: FastAPI):
         print(f"[MCP] failed to start excelcat-skills: {e}")
 
     try:
+        app.state.mcp_analysis = await _connect(_ANALYSIS_SERVER, "excelcat-analysis")
+    except Exception as e:
+        print(f"[MCP] failed to start excelcat-analysis: {e}")
+
+    try:
         yield
     finally:
         await stack.aclose()
         app.state.mcp_verify = None
         app.state.mcp_skills = None
+        app.state.mcp_analysis = None
 
 
 app = FastAPI(lifespan=lifespan)
 
+# Only the add-in's own origin (webpack dev server, per manifest.xml) may call
+# this API. The old wildcard + allow_credentials combo is invalid per the CORS
+# spec and needlessly let any local page hit the backend.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -607,89 +619,113 @@ def _row_template(value: str, row: int) -> str:
     return pattern.sub(sub, value)
 
 
+def _is_formula_value(value: str) -> bool:
+    """A cell write is a formula if its (stripped) value begins with '='."""
+    return bool(value) and value.strip().startswith("=")
+
+
+def _build_pattern_card(col: str, pattern: str, block: list) -> dict:
+    """
+    Build one apply_formula_pattern card from a block of (row, idx, cell, value)
+    tuples (sorted by row; an optional text header may be at the front). `range`
+    spans the block's first→last row; the explicit cells/values list is the
+    source of truth, so a skipped row (e.g. a subtotal) simply doesn't appear.
+    """
+    cells = [it[2] for it in block]
+    values = [it[3] for it in block]
+    rows = [it[0] for it in block]
+    rng = f"{col}{min(rows)}:{col}{max(rows)}"
+    return {
+        "name": "apply_formula_pattern",
+        "args": {
+            "pattern": pattern,
+            "range":   rng,
+            "cells":   cells,
+            "values":  values,
+        },
+    }
+
+
 def _collapse_row_pattern_writes(tool_calls: list[dict]) -> list[dict]:
     """
-    Walk the tool_calls list and collapse runs of ≥3 write_to_cell calls that:
-      (1) target the same column,
-      (2) on contiguous rows (after sorting),
-      (3) and whose values reduce to the same row-templated form.
+    Collapse a column's write_to_cell calls into one apply_formula_pattern card
+    per formula pattern, so the user confirms a whole column fill once instead
+    of N times.
 
-    Returns a possibly-shorter list where each collapsed run becomes one
-    apply_formula_pattern tool_call. Any tool_call that doesn't fit a run
-    is preserved unchanged.
+    Order-independent and gap-tolerant. The model interleaves columns
+    (D2, E2, D3, E3, …) and skips non-data rows (subtotals, blank separators),
+    so we bucket by column and then group each column's formula cells by their
+    row-template — NOT by contiguous rows. A skipped subtotal row must not split
+    one column into two cards. A single text header rides along when it sits
+    directly above a group's top cell (e.g. "Year Diff" above =C{r}-B{r}).
+
+    Honesty bar: we only group same-column cells whose formulas reduce to one
+    identical pattern; every cell→value (header included) is listed explicitly
+    on the card, gaps and all. Non-write tools, unparseable writes, and groups
+    under the ≥3 bar are preserved as individual items, ordered by original
+    position so the approval-card order stays stable.
     """
     if not tool_calls:
         return tool_calls
 
-    out: list[dict] = []
-    i = 0
-    n = len(tool_calls)
-    while i < n:
-        t = tool_calls[i]
-        if t.get("name") != "write_to_cell":
-            out.append(t)
-            i += 1
-            continue
+    # Bucket parseable cell writes by column; keep everything else as
+    # passthrough, each tagged with its original index so we can restore order.
+    columns: dict = {}                 # col -> [(row, idx, cell, value), …]
+    passthrough: list = []             # [(idx, tool), …]
+    for idx, t in enumerate(tool_calls):
+        parsed = None
+        value = ""
+        if t.get("name") == "write_to_cell":
+            parsed = _parse_cell(t.get("args", {}).get("cell", ""))
+            value = t.get("args", {}).get("value", "")
+        if parsed and value != "":
+            col, row = parsed
+            columns.setdefault(col, []).append((row, idx, t["args"]["cell"], value))
+        else:
+            passthrough.append((idx, t))
 
-        # Try to extend a run starting at i.
-        run = [t]
-        parsed_first = _parse_cell(t.get("args", {}).get("cell", ""))
-        first_value = t.get("args", {}).get("value", "")
-        if not parsed_first or first_value == "":
-            out.append(t)
-            i += 1
-            continue
-        first_col, first_row = parsed_first
-        first_template = _row_template(first_value, first_row)
+    emitted: list = list(passthrough)  # [(order_idx, tool), …]
 
-        j = i + 1
-        while j < n:
-            tj = tool_calls[j]
-            if tj.get("name") != "write_to_cell":
-                break
-            parsed = _parse_cell(tj.get("args", {}).get("cell", ""))
-            value = tj.get("args", {}).get("value", "")
-            if not parsed or value == "":
-                break
-            col_j, row_j = parsed
-            # Same column, contiguous row.
-            if col_j != first_col:
-                break
-            # We don't require strict +1 ordering from the LLM; we just
-            # require the *set* of rows to be contiguous. Build greedily,
-            # validate after.
-            template_j = _row_template(value, row_j)
-            if template_j != first_template:
-                break
-            run.append(tj)
-            j += 1
+    def _emit_individual(items):
+        for _row, idx, _cell, _value in items:
+            emitted.append((idx, tool_calls[idx]))
 
-        # Validate the run: ≥3, rows form a contiguous span when sorted.
-        if len(run) >= 3:
-            rows = sorted(_parse_cell(r["args"]["cell"])[1] for r in run)
-            if rows == list(range(rows[0], rows[0] + len(rows))):
-                # Reorder run by row so cells/values are sorted top-to-bottom.
-                run.sort(key=lambda r: _parse_cell(r["args"]["cell"])[1])
-                cells  = [r["args"]["cell"] for r in run]
-                values = [r["args"]["value"] for r in run]
-                rng    = f"{first_col}{rows[0]}:{first_col}{rows[-1]}"
-                out.append({
-                    "name": "apply_formula_pattern",
-                    "args": {
-                        "pattern": first_template,
-                        "range":   rng,
-                        "cells":   cells,
-                        "values":  values,
-                    },
-                })
-                i = j
+    for col, items in columns.items():
+        items.sort(key=lambda x: x[0])  # by row
+        formula_items = [it for it in items if _is_formula_value(it[3])]
+        header_items  = [it for it in items if not _is_formula_value(it[3])]
+
+        # Group formula cells by row-template (gaps allowed). A column with a
+        # single uniform fill yields one group; a genuinely different formula
+        # (e.g. a subtotal row) lands in its own group and is judged separately.
+        groups: dict = {}              # template -> [items], row-sorted
+        for it in formula_items:
+            groups.setdefault(_row_template(it[3], it[0]), []).append(it)
+
+        # A lone text header attaches to the group it sits directly above; with
+        # 0 or 2+ headers we don't guess — they go through as individual writes.
+        header = header_items[0] if len(header_items) == 1 else None
+        header_used = False
+
+        for pattern, group in groups.items():
+            if len(group) < 3:
+                _emit_individual(group)
                 continue
+            block = group
+            if header and not header_used and header[0] == group[0][0] - 1:
+                block = [header] + group
+                header_used = True
+            card = _build_pattern_card(col, pattern, block)
+            emitted.append((min(it[1] for it in block), card))
 
-        # Run didn't qualify — emit just the first call and advance by 1.
-        out.append(t)
-        i += 1
+        # Header that never attached (or 2+ ambiguous headers) → individual.
+        if header and not header_used:
+            _emit_individual([header])
+        if len(header_items) > 1:
+            _emit_individual(header_items)
 
-    return out
+    emitted.sort(key=lambda x: x[0])
+    return [tool for _, tool in emitted]
 
 
 def _first_critique(log: list) -> str:
@@ -733,6 +769,25 @@ class ReviewRequest(BaseModel):
     values: List[List[Any]]
     formulas: List[List[Any]] = []
     address: str = ""
+    audit_enabled: Optional[bool] = True
+
+
+class VarianceRequest(BaseModel):
+    """Variance analysis: read-only, sourced from a statement worksheet (v1: IS).
+
+    The frontend chip reads the Income Statement tab's used range and posts it
+    here — distinct from the active-selection ChatRequest.context shape.
+    """
+    values: List[List[Any]]
+    # Accepted for forward-compatibility but NOT forwarded to the analysis
+    # server — analyse_variance works on values only.
+    formulas: List[List[Any]] = []
+    address: str = ""
+    sheet: str = ""
+    # Clearly-trivial materiality threshold (absolute, in the sheet's own units).
+    # Line items whose change is below it are split out as immaterial. 0 = no filter.
+    clearly_trivial: float = 0.0
+    model: Optional[Literal["gemini-2.5-flash", "deepseek-v4-flash"]] = "deepseek-v4-flash"
     audit_enabled: Optional[bool] = True
 
 # ── Main endpoint ─────────────────────────────────────────
@@ -825,11 +880,20 @@ async def chat_endpoint(request: ChatRequest):
     # 3. Build context string
     context_str = ""
     if request.context:
-        data_rows = request.context.values[:10]
+        MAX_CONTEXT_ROWS = 100
+        all_rows  = request.context.values
+        data_rows = all_rows[:MAX_CONTEXT_ROWS]
+        truncated = len(all_rows) > MAX_CONTEXT_ROWS
+        label = (
+            f"Data (first {MAX_CONTEXT_ROWS} of {request.context.rowCount} rows — "
+            f"SELECTION TRUNCATED, more rows exist below):"
+            if truncated else
+            f"Data (all {len(data_rows)} rows):"
+        )
         context_str = (
             f"Range: {request.context.address} on sheet '{request.context.sheet}'\n"
             f"Size: {request.context.rowCount} rows x {request.context.columnCount} cols\n"
-            f"Data (first 10 rows):\n"
+            f"{label}\n"
             + "\n".join([", ".join(str(v) for v in row) for row in data_rows])
         )
 
@@ -1208,3 +1272,93 @@ async def review_endpoint(request: ReviewRequest):
         review["results"],
         review["summary"],
     )
+
+
+# ── Variance Analysis (on-demand, read-only YoY analysis) ──────────────────────
+@app.post("/variance")
+async def variance_endpoint(request: VarianceRequest):
+    """
+    Year-over-year variance analysis over a financial statement (v1: Income
+    Statement). Read-only — never writes cells. The deterministic delta
+    computation and the two LLM passes run in the excelcat-analysis MCP server;
+    this endpoint owns request_id generation, loads the variance contract from
+    excelcat-skills, and keeps the audit chokepoint (the `variance_run` event).
+    """
+    audit_enabled = bool(request.audit_enabled)
+    request_id = str(uuid.uuid4())
+    selected_model = request.model or "deepseek-v4-flash"
+
+    def _finish(result: dict, *, error=False) -> dict:
+        # Audit payload carries `address` + the materiality threshold that was
+        # applied, so the trail records what counted as trivial. The frontend
+        # response keeps the result shape. `error` is additive — only on a
+        # degraded path. (result may also echo clearly_trivial; it overrides and
+        # should match.)
+        payload = {"address": request.address, "clearly_trivial": request.clearly_trivial, **result}
+        if error:
+            payload["error"] = True
+        audit.append_event(
+            "variance_run", payload, request_id=request_id, enabled=audit_enabled
+        )
+        resp = {"request_id": request_id, **result}
+        if error:
+            resp["error"] = True
+        return resp
+
+    def _error_result(msg: str) -> dict:
+        # Empty result shape + error flag; `msg` lands in `summary`, which the
+        # frontend renders. Used for both degraded paths (a service down) and
+        # honest refusals (statement too large).
+        return _finish(
+            {
+                "current_label": "", "prior_label": "",
+                "variance_table": [], "skipped": [],
+                "anomalies": [], "cfo_questions": [], "summary": msg,
+            },
+            error=True,
+        )
+
+    # Guard: Pass A puts the whole grid in front of the LLM, so a polluted used
+    # range (one stray cell at ZZ10000 balloons it to millions of cells) must be
+    # refused here — before the token bill — with a message that says why. A
+    # real income statement sits far inside these bounds.
+    MAX_VARIANCE_ROWS, MAX_VARIANCE_COLS = 200, 30
+    n_rows = len(request.values)
+    n_cols = max((len(r) for r in request.values), default=0)
+    if n_rows > MAX_VARIANCE_ROWS or n_cols > MAX_VARIANCE_COLS:
+        return _error_result(
+            f"The sheet's used range is {n_rows} rows × {n_cols} columns — too large to "
+            f"analyse (limit {MAX_VARIANCE_ROWS} × {MAX_VARIANCE_COLS}). This usually means "
+            "stray cells outside the statement; clear them and try again."
+        )
+
+    session = getattr(app.state, "mcp_analysis", None)
+    if session is None:
+        return _error_result("Variance analysis is temporarily unavailable (analysis service not running).")
+
+    # Load the contract from excelcat-skills (single source of truth for the
+    # relationship framework). Without it the analysis loses its guard-rails, so
+    # we fail loud rather than silently run a weaker prompt.
+    try:
+        contract_md = await _load_skill_content("variance_analysis") or ""
+    except RuntimeError:
+        return _error_result("Variance analysis is temporarily unavailable (skills service not running).")
+
+    try:
+        result = _unwrap_tool_result(await session.call_tool(
+            "analyse_variance",
+            {
+                "statement": {
+                    "values": request.values,
+                    "address": request.address,
+                    "sheet": request.sheet,
+                },
+                "contract_md": contract_md,
+                "model": selected_model,
+                "clearly_trivial": request.clearly_trivial or 0.0,
+            },
+        ))
+    except Exception as e:
+        return _error_result(f"Variance analysis is temporarily unavailable (analysis call failed: {e}).")
+
+    return _finish(result)

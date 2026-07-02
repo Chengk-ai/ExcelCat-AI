@@ -7,6 +7,8 @@
   --border:    #e3e1e8;
   --accent:    #4d4b5c;
   --accent2:   #36344a;
+  --accent-tint: rgba(77, 75, 92, 0.08);  /* hover / pill fills */
+  --accent-ring: rgba(77, 75, 92, 0.15);  /* focus ring */
   --text:      #2a2833;
   --text-muted:#7a7884;
   --user-bg:   #f4f2f7;
@@ -131,47 +133,73 @@ html, body {
   transform: translateY(0);
 }
 
-/* ── Audit toggle ──
-   The audit-toggle button shows a small status dot in the bottom-right
-   corner: green = audit ON, grey = OFF. Click to flip. State is persisted
-   in localStorage and sent with every /chat request. */
-.icon-btn.audit-toggle {
-  position: relative;
-}
-.audit-dot {
-  position: absolute;
-  right: 2px;
-  bottom: 2px;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #4ade80;            /* on by default — matches default state */
-  box-shadow: 0 0 0 1.5px var(--surface);
-  transition: background 0.15s;
-}
-.icon-btn.audit-toggle.off .audit-dot {
-  background: #6b7280;            /* grey when audit is disabled */
-}
-.icon-btn.audit-toggle.on:hover .audit-dot {
-  background: #34d399;
-}
+/* ── Audit overflow menu ──
+   The three audit tools (record toggle / download / clear) live in a
+   dropdown anchored to the ⋯ button. The record toggle is a switch that
+   reflects state.auditEnabled; state persists in localStorage and is sent
+   with every /chat request. */
+.menu-wrap { position: relative; }
 
-/* ── Quick Actions ── */
-#quick-actions {
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
+.audit-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 232px;
   background: var(--surface);
-  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  box-shadow: 0 12px 30px rgba(40,38,55,0.18);
+  padding: 6px;
+  z-index: 60;
 }
+.audit-menu[hidden] { display: none; }
+.audit-menu-label {
+  font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.8px; color: var(--text-muted); padding: 7px 9px 5px;
+}
+.audit-menu-item {
+  width: 100%; display: flex; align-items: center; gap: 9px;
+  padding: 8px 9px; border: none; background: transparent;
+  border-radius: 8px; cursor: pointer; text-align: left;
+  color: var(--text); font-family: var(--font-sans); font-size: 12.5px;
+}
+.audit-menu-item svg { width: 15px; height: 15px; color: var(--accent); flex-shrink: 0; }
+.audit-menu-item:hover { background: var(--accent-tint); }
+.audit-menu-item .audit-menu-text { flex: 1; }
+.audit-menu-item.danger { color: #b54a4a; }
+.audit-menu-item.danger svg { color: #b54a4a; }
+
+/* Toggle switch (replaces the corner dot) */
+.audit-switch {
+  width: 30px; height: 18px; border-radius: 10px;
+  background: #cfccd6; position: relative; flex-shrink: 0; transition: background 0.15s;
+}
+.audit-switch-knob {
+  position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+  transition: left 0.15s;
+}
+.audit-menu-item.on .audit-switch { background: var(--accent); }
+.audit-menu-item.on .audit-switch-knob { left: 14px; }
+
+/* ── Quick Actions (nested in the empty state) ──
+   The helper chips + audit tools only show while the conversation is empty;
+   they live inside #empty-state, so they hide/show with the chat for free. */
 .qa-label {
-  font-size: 10px;
+  width: 100%;
+  max-width: 280px;
+  font-size: 11px;
   font-weight: 500;
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.8px;
-  margin-bottom: 8px;
+  margin: 14px auto 8px;
+  text-align: left;
 }
 .qa-chips {
+  width: 100%;
+  max-width: 280px;
+  margin: 0 auto;
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -191,7 +219,159 @@ html, body {
 .chip:hover {
   border-color: var(--accent);
   color: var(--accent2);
-  background: rgba(217, 119, 87, 0.11);
+  background: var(--accent-tint);
+}
+
+/* Audit tools render as list rows (not pills) so users read them as
+   "run a report", not "fill the input". Icon + title + one-line desc + RUN. */
+.audit-tools {
+  width: 100%;
+  max-width: 280px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.audit-tool {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s, background 0.15s;
+}
+.audit-tool:hover {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+}
+.audit-tool-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+.audit-tool-icon svg { width: 16px; height: 16px; }
+.audit-tool-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.audit-tool-title {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+}
+.audit-tool-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+.audit-tool-run {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  color: var(--accent);
+  background: var(--accent-tint);
+  border: 1px solid rgba(77, 75, 92, 0.2);
+  border-radius: 4px;
+  padding: 2px 7px;
+}
+
+/* ⓘ "learn more" — low-key so it reads as help, not as the RUN action. */
+.audit-tool-info-btn {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.audit-tool-info-btn:hover { background: var(--accent-tint); color: var(--accent); }
+.audit-tool-info-btn svg { width: 15px; height: 15px; }
+.audit-tool-info-btn[aria-expanded="true"] { color: var(--accent); background: var(--accent-tint); }
+
+/* Inline explainer — opens below the row. */
+.audit-tool-info {
+  margin-top: 6px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  text-align: left;
+  animation: fadeIn 0.15s ease;
+}
+.audit-tool-info[hidden] { display: none; }
+.ati-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ati-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--accent);
+}
+.ati-text {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.5;
+}
+.ati-text code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  color: var(--accent2);
+}
+
+/* 16:9 video slot. Placeholder until a data-video id is set, then the iframe
+   is injected to fill the box. */
+.audit-tool-video {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+}
+.audit-tool-video iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+.ati-video-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
 }
 
 /* ── Collapsible Panel Base ── */
@@ -218,14 +398,14 @@ html, body {
 }
 .panel-title {
   flex: 1;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.8px;
   color: var(--text-muted);
 }
 .panel-badge {
-  font-size: 10px;
+  font-size: 11px;
   font-family: var(--font-mono);
   padding: 1px 6px;
   border-radius: 4px;
@@ -247,7 +427,10 @@ html, body {
 .panel.collapsed .panel-body { max-height: 0; opacity: 0; }
 .panel-inner { padding: 0 14px 12px; }
 
-/* ── Verification Panel ── */
+/* ── Verification Panel ──
+   Hidden until the first check arrives; revealed by appendVerifyLog() and
+   re-hidden when the conversation is cleared. */
+#panel-verify { display: none; }
 #panel-verify .panel-dot  { background: #a78bfa; box-shadow: 0 0 6px rgba(167,139,250,0.5); }
 #panel-verify .panel-badge { color: #a78bfa; border-color: rgba(167,139,250,0.25); background: rgba(167,139,250,0.11); }
 
@@ -259,20 +442,6 @@ html, body {
   overflow-y: auto;
   padding-right: 2px;
 }
-.verify-empty {
-  border: 1.5px dashed var(--border);
-  border-radius: 10px;
-  padding: 14px 12px;
-  text-align: center;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  color: var(--text-muted);
-  line-height: 1.5;
-}
-.verify-empty svg { width: 16px; height: 16px; color: #a78bfa; opacity: 0.7; }
 
 .verify-entry {
   border: 1px solid var(--border);
@@ -294,7 +463,7 @@ html, body {
   font-size: 11px;
 }
 .verify-entry-badge {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   padding: 2px 7px;
   border-radius: 20px;
@@ -305,7 +474,7 @@ html, body {
 .verify-entry-badge.warning    { color: #f59e42;        background: rgba(245,158,66,0.15); }
 .verify-entry-tool {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 11px;
   color: var(--text);
   flex: 1;
   overflow: hidden;
@@ -313,7 +482,7 @@ html, body {
   white-space: nowrap;
 }
 .verify-entry-time {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--text-muted);
 }
 
@@ -340,7 +509,7 @@ html, body {
   align-items: center;
 }
 .verify-entry-chip {
-  font-size: 10px;
+  font-size: 11px;
   font-family: var(--font-mono);
   color: var(--text-muted);
   background: rgba(167,139,250,0.11);
@@ -349,7 +518,7 @@ html, body {
   padding: 1px 6px;
 }
 .verify-entry-iters {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--text-muted);
   margin-left: auto;
 }
@@ -415,7 +584,7 @@ html, body {
 }
 .verify-entry-decision {
   align-self: flex-start;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   padding: 2px 8px;
   border-radius: 20px;
@@ -523,16 +692,17 @@ html, body {
   font-weight: 700;
   margin-top: 1px;
 }
-.msg-avatar.ai  { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; }
+.msg-avatar.ai  { background: transparent; color: #fff; overflow: hidden; }
 .msg-avatar.usr { background: var(--surface2); border: 1px solid var(--border); color: var(--text-muted); }
 .msg-avatar svg { width: 14px; height: 14px; display: block; }
+.msg-avatar.ai img { width: 100%; height: 100%; object-fit: cover; display: block; }
 
 .msg-body {
   flex: 1;
   min-width: 0;
 }
 .msg-role {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.6px;
   text-transform: uppercase;
@@ -649,8 +819,8 @@ html, body {
   align-items: center;
   gap: 6px;
   padding: 5px 10px;
-  background: rgba(217, 119, 87, 0.13);
-  border: 1px solid rgba(217, 119, 87, 0.25);
+  background: var(--accent-tint);
+  border: 1px solid rgba(77, 75, 92, 0.2);
   border-radius: 8px;
   margin-bottom: 8px;
   font-size: 11px;
@@ -678,7 +848,7 @@ html, body {
 }
 .textarea-wrap:focus-within {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(217, 119, 87, 0.16);
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
 #chat-input {
@@ -725,16 +895,16 @@ html, body {
   margin-top: 7px;
 }
 .input-hint {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--text-muted);
   font-family: var(--font-mono);
 }
 .model-select {
-  font-size: 10px;
+  font-size: 11px;
   font-family: var(--font-mono);
   color: var(--accent);
-  background: rgba(217, 119, 87, 0.11);
-  border: 1px solid rgba(217, 119, 87, 0.2);
+  background: var(--accent-tint);
+  border: 1px solid rgba(77, 75, 92, 0.2);
   border-radius: 5px;
   padding: 3px 7px;
   outline: none;
@@ -804,7 +974,7 @@ html, body {
 }
 .approval-card-status {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 11px;
   padding: 2px 7px;
   border-radius: 4px;
 }
@@ -835,7 +1005,7 @@ html, body {
   line-height: 1.55;
 }
 .approval-card-issues-label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.6px;
@@ -954,7 +1124,7 @@ html, body {
 }
 .approval-retry-form.open { display: flex; }
 .approval-retry-form label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.6px;
@@ -998,18 +1168,6 @@ html, body {
 .approval-card-resolution.approved { color: var(--accent2); background: rgba(34,197,94,0.09); }
 .approval-card-resolution.rejected { color: var(--text-muted); background: var(--surface); }
 
-/* ── Review Assumptions chip ── */
-.chip.chip-review {
-  border-color: rgba(167,139,250,0.35);
-  background: rgba(167,139,250,0.08);
-  color: #7c6bc4;
-}
-.chip.chip-review:hover {
-  border-color: rgba(167,139,250,0.6);
-  background: rgba(167,139,250,0.16);
-  color: #5b49a6;
-}
-
 /* ── Review Report Card (read-only) ── */
 .review-report {
   margin-top: 10px;
@@ -1035,7 +1193,7 @@ html, body {
 }
 .review-report-badge {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 11px;
   padding: 2px 7px;
   border-radius: 4px;
 }
@@ -1084,7 +1242,7 @@ html, body {
   border-left-color: rgba(91,156,246,0.6);
 }
 .review-report-item-label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -1102,3 +1260,120 @@ html, body {
   border-top: 1px solid var(--border);
   font-family: var(--font-mono);
 }
+
+/* ── Variance report: YoY table + Questions for CFO (reuses .review-report shell) ── */
+.variance-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.variance-table th {
+  text-align: right;
+  font-weight: 500;
+  color: var(--text-muted);
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.variance-table th:first-child { text-align: left; }
+.variance-table td {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.variance-table .vt-label { text-align: left; color: var(--text); }
+.variance-table .vt-num { text-align: right; color: var(--text); white-space: nowrap; }
+.variance-table .vt-num.pos { color: var(--accent2); }
+.variance-table .vt-num.neg { color: #ef5e6e; }
+
+.variance-cfo {
+  font-size: 11.5px;
+  line-height: 1.5;
+  border-left: 3px solid rgba(45,212,191,0.6);
+  padding: 6px 10px;
+  border-radius: 0 6px 6px 0;
+  background: var(--surface);
+}
+.variance-cfo-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #0f9488;
+  margin-bottom: 4px;
+}
+.variance-cfo ul { margin: 0; padding-left: 16px; }
+.variance-cfo li { margin: 2px 0; color: var(--text); }
+
+/* Trivial (below-materiality) rows: kept visible for audit transparency, muted. */
+.variance-table tr.vt-trivial td { color: var(--text-muted); opacity: 0.7; }
+.vt-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-left: 6px;
+}
+.variance-materiality,
+.variance-skipped {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  padding: 2px 2px 0;
+}
+
+/* ── Materiality prompt card (asked before each variance run) ── */
+.materiality-prompt {
+  margin-top: 10px;
+  background: var(--surface2);
+  border: 1px solid rgba(45,212,191,0.3);
+  border-radius: 10px;
+  padding: 12px;
+  animation: msgIn 0.2s ease-out;
+}
+.mat-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.mat-help {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.45;
+  margin-bottom: 8px;
+}
+.mat-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.mat-input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+.mat-input:focus { outline: none; border-color: rgba(45,212,191,0.6); }
+.mat-run {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 6px 12px;
+  border: 1px solid rgba(45,212,191,0.5);
+  border-radius: 6px;
+  background: rgba(45,212,191,0.12);
+  color: #0f9488;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mat-run:hover:not(:disabled) { background: rgba(45,212,191,0.2); }
+.mat-run:disabled { opacity: 0.6; cursor: default; }

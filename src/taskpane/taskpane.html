@@ -26,73 +26,38 @@
       <span>AI spreadsheet agent</span>
     </div>
     <div class="header-actions">
-      <!-- Audit toggle: persists in localStorage. When ON the backend writes
-           audit.jsonl + audit.md; when OFF nothing is recorded.
-           Uses data-tip (CSS tooltip below the button) instead of title to
-           avoid the native tooltip overlapping nearby header text. -->
-      <button class="icon-btn audit-toggle has-tip" id="btn-audit" aria-label="Audit trail: ON" data-tip="Audit trail: ON">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-          <path d="M3 2h7l3 3v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"/>
-          <path d="M10 2v3h3"/>
-          <path d="M5 9h6M5 11.5h4"/>
-        </svg>
-        <span class="audit-dot" id="audit-dot" aria-hidden="true"></span>
-      </button>
-      <!-- Download audit: renders audit.jsonl → audit.md on demand and downloads. -->
-      <button class="icon-btn has-tip" id="btn-audit-download" aria-label="Download audit trail" data-tip="Download audit trail">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-          <path d="M8 2v8M5 7l3 3 3-3"/>
-          <path d="M3 12h10v1H3z"/>
-        </svg>
-      </button>
-      <!-- Clear audit: deletes audit.jsonl + audit.md on backend. -->
-      <button class="icon-btn has-tip" id="btn-audit-clear" aria-label="Clear audit trail" data-tip="Clear audit trail">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
-          <path d="M3 2h7l3 3v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"/>
-          <path d="M10 2v3h3"/>
-          <path d="M5.5 9.5l5 3M10.5 9.5l-5 3"/>
-        </svg>
-      </button>
       <!-- Clear chat -->
       <button class="icon-btn has-tip" id="btn-clear" aria-label="Clear conversation" data-tip="Clear conversation">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
           <path d="M3 4h10M6 4V3h4v1M5 4l.5 9h5l.5-9"/>
         </svg>
       </button>
+      <!-- Audit tools live in an overflow menu: toggle recording, download
+           audit.md, clear the trail. The toggle persists in localStorage and
+           is sent with every /chat request. -->
+      <div class="menu-wrap">
+        <button class="icon-btn" id="btn-menu" aria-label="More" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="3" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="8" cy="13" r="1.4"/></svg>
+        </button>
+        <div class="audit-menu" id="audit-menu" hidden>
+          <div class="audit-menu-label">Audit Trail</div>
+          <button class="audit-menu-item" id="mi-audit-toggle">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 2h7l3 3v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"/><path d="M10 2v3h3"/><path d="M5 9h6M5 11.5h4"/></svg>
+            <span class="audit-menu-text">Record audit trail</span>
+            <span class="audit-switch" id="audit-switch"><span class="audit-switch-knob"></span></span>
+          </button>
+          <button class="audit-menu-item" id="mi-audit-download">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2v8M5 7l3 3 3-3"/><path d="M3 12h10v1H3z"/></svg>
+            <span class="audit-menu-text">Download audit (.md)</span>
+          </button>
+          <button class="audit-menu-item danger" id="mi-audit-clear">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 4h10M6 4V3h4v1M5 4l.5 9h5l.5-9"/></svg>
+            <span class="audit-menu-text">Clear audit trail</span>
+          </button>
+        </div>
+      </div>
     </div>
   </header>
-
-<!-- Quick actions -->
-<div id="quick-actions">
-  <div class="qa-label">Quick Actions</div>
-  <div class="qa-chips">
-
-    <div class="chip" data-prompt="Summarise the selected data">
-      Summarise Data
-    </div>
-
-    <div class="chip" data-prompt="Find outliers and anomalies in the selected data">
-      Find Outliers
-    </div>
-
-    <div class="chip" data-prompt="Clean and standardise the selected data">
-      Clean Data
-    </div>
-
-    <div class="chip" data-prompt="Write a one paragraph plain English analysis of the selected data">
-      Analyse Data
-    </div>
-
-    <div class="chip" data-prompt="Create a chart for the selected data">
-      Chart It
-    </div>
-
-    <div class="chip chip-review" id="chip-review">
-      Review Assumptions
-    </div>
-
-  </div>
-</div>
 
   <!-- Verification Layer Panel -->
   <div class="panel" id="panel-verify">
@@ -108,14 +73,7 @@
     </div>
     <div class="panel-body">
       <div class="panel-inner">
-        <div class="verify-log" id="verify-log">
-          <div class="verify-empty" id="verify-empty">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M8 2l1.5 3 3.5.5-2.5 2.5.5 3.5L8 10l-3 1.5.5-3.5L3 5.5 6.5 5z"/>
-            </svg>
-            No checks yet. Verification entries will appear here as the AI proposes actions.
-          </div>
-        </div>
+        <div class="verify-log" id="verify-log"></div>
       </div>
     </div>
   </div>
@@ -126,6 +84,73 @@
       <div class="empty-icon"><img src="../../assets/cat-head.png" alt="" /></div>
       <h2>What can I help with?</h2>
       <p>Ask me to analyse data, write formulas, clean cells, or anything else in your spreadsheet.</p>
+
+      <div class="qa-label">AI Helpers</div>
+      <div class="qa-chips">
+        <div class="chip" data-prompt="Summarise the selected data">Summarise Data</div>
+        <div class="chip" data-prompt="Find outliers and anomalies in the selected data">Find Outliers</div>
+        <div class="chip" data-prompt="Clean and standardise the selected data">Clean Data</div>
+        <div class="chip" data-prompt="Write a one paragraph plain English analysis of the selected data">Analyse Data</div>
+        <div class="chip" data-prompt="Create a chart for the selected data">Chart It</div>
+      </div>
+
+      <div class="qa-label">Audit Tools</div>
+      <!-- Audit tools. Each tool is a clickable row that runs a report; the
+           ⓘ button expands an inline explainer (what it checks / needs / gives)
+           plus a demo-video slot. To wire a video, paste a YouTube embed id
+           into the .audit-tool-video[data-video] attribute — the iframe is then
+           lazily injected the first time the explainer is opened. No code change
+           needed; an empty data-video shows the "coming soon" placeholder. -->
+      <div class="audit-tools">
+        <div class="audit-tool-wrap">
+          <div class="audit-tool" id="chip-review">
+            <span class="audit-tool-icon">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 2h7l3 3v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"/><path d="M10 2v3h3"/><path d="M5 9h6M5 11.5h4"/></svg>
+            </span>
+            <span class="audit-tool-text">
+              <span class="audit-tool-title">Review Assumptions</span>
+              <span class="audit-tool-desc">Locate &amp; sanity-check model inputs</span>
+            </span>
+            <button class="audit-tool-info-btn" type="button" aria-label="Learn more about Review Assumptions" aria-expanded="false">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.25"/><path d="M8 7.25v3.75"/><circle cx="8" cy="4.9" r="0.7" fill="currentColor" stroke="none"/></svg>
+            </button>
+            <span class="audit-tool-run">RUN</span>
+          </div>
+          <div class="audit-tool-info" hidden>
+            <div class="ati-item"><span class="ati-label">What it checks</span><span class="ati-text">Finds the key inputs your model relies on (WACC, tax rate, growth rate…) and checks each against sensible ranges.</span></div>
+            <div class="ati-item"><span class="ati-label">What it needs</span><span class="ati-text">Select the range that holds your model first, then click the row.</span></div>
+            <div class="ati-item"><span class="ati-label">What you get</span><span class="ati-text">A report card listing any inputs that look off, each with the reason.</span></div>
+            <div class="audit-tool-video" data-video="">
+              <div class="ati-video-placeholder">Demo video — coming soon</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="audit-tool-wrap">
+          <div class="audit-tool" id="chip-variance">
+            <span class="audit-tool-icon">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 13V3M2 13h12M5 11V7M8.5 11V5M12 11V9"/></svg>
+            </span>
+            <span class="audit-tool-text">
+              <span class="audit-tool-title">Variance Analysis</span>
+              <span class="audit-tool-desc">Compare years &amp; flag anomalies</span>
+            </span>
+            <button class="audit-tool-info-btn" type="button" aria-label="Learn more about Variance Analysis" aria-expanded="false">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.25"/><path d="M8 7.25v3.75"/><circle cx="8" cy="4.9" r="0.7" fill="currentColor" stroke="none"/></svg>
+            </button>
+            <span class="audit-tool-run">RUN</span>
+          </div>
+          <div class="audit-tool-info" hidden>
+            <div class="ati-item"><span class="ati-label">What it checks</span><span class="ati-text">Compares this year against last year line by line and flags unusual movements.</span></div>
+            <div class="ati-item"><span class="ati-label">What it needs</span><span class="ati-text">A worksheet named <code>IS</code> or <code>Income Statement</code>.</span></div>
+            <div class="ati-item"><span class="ati-label">Set a materiality threshold</span><span class="ati-text">Before it runs, you set a <em>clearly-trivial threshold</em>: line items whose change is smaller than this are set aside as trivial, so you focus on the moves that matter. A sensible default (≈ 1% of the largest figure) is pre-filled — overwrite it if you like.</span></div>
+            <div class="ati-item"><span class="ati-label">What you get</span><span class="ati-text">A year-on-year table plus suggested questions to put to the CFO.</span></div>
+            <div class="audit-tool-video" data-video="">
+              <div class="ati-video-placeholder">Demo video — coming soon</div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 

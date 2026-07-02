@@ -9,6 +9,10 @@ const state = {
   auditEnabled: (localStorage.getItem('excelmate.auditEnabled') ?? 'true') === 'true',
 };
 
+// ── Backend ────────────────────────────────────────────
+// Single home for the backend origin — every fetch goes through this.
+const API_BASE = 'http://127.0.0.1:8000';
+
 // ── DOM ────────────────────────────────────────────────
 const messagesEl   = document.getElementById('messages');
 const emptyState   = document.getElementById('empty-state');
@@ -18,9 +22,12 @@ const selPill      = document.getElementById('selection-pill');
 const selLabel     = document.getElementById('selection-label');
 const clearSelBtn  = document.getElementById('clear-sel');
 const btnClear     = document.getElementById('btn-clear');
-const btnAudit     = document.getElementById('btn-audit');
-const btnAuditClear= document.getElementById('btn-audit-clear');
-const btnAuditDl   = document.getElementById('btn-audit-download');
+const btnMenu      = document.getElementById('btn-menu');
+const auditMenu    = document.getElementById('audit-menu');
+const miAuditToggle= document.getElementById('mi-audit-toggle');
+const miAuditClear = document.getElementById('mi-audit-clear');
+const miAuditDl    = document.getElementById('mi-audit-download');
+const panelVerify  = document.getElementById('panel-verify');
 const modelSelect  = document.getElementById('model-select');
 state.selectedModel = 'deepseek-v4-flash';
 
@@ -30,42 +37,48 @@ if (modelSelect) {
   });
 }
 
+// ── Audit overflow menu ────────────────────────────────
+// Open/close the ⋯ dropdown. Closes on outside click.
+function setMenu(open) {
+  if (!auditMenu || !btnMenu) return;
+  auditMenu.hidden = !open;
+  btnMenu.setAttribute('aria-expanded', String(open));
+}
+if (btnMenu) {
+  btnMenu.addEventListener('click', e => { e.stopPropagation(); setMenu(auditMenu.hidden); });
+  document.addEventListener('click', e => {
+    if (!e.target.closest('#audit-menu, #btn-menu')) setMenu(false);
+  });
+}
+
 // ── Audit toggle ───────────────────────────────────────
-// Sync the button visual to current state, then wire click → flip + persist.
+// Sync the switch visual to current state, then wire click → flip + persist.
 function applyAuditUi() {
-  if (!btnAudit) return;
-  // Native `title` removed — we use the CSS .has-tip tooltip (data-tip)
-  // so the hover hint sits below the button and never covers other text.
-  // aria-label is kept in sync for screen readers.
+  if (!miAuditToggle) return;
+  miAuditToggle.classList.toggle('on', state.auditEnabled);
   const tip = state.auditEnabled
     ? 'Audit trail: ON (click to disable)'
     : 'Audit trail: OFF (click to enable)';
-  if (state.auditEnabled) {
-    btnAudit.classList.remove('off');
-    btnAudit.classList.add('on');
-  } else {
-    btnAudit.classList.remove('on');
-    btnAudit.classList.add('off');
-  }
-  btnAudit.setAttribute('data-tip', tip);
-  btnAudit.setAttribute('aria-label', tip);
+  miAuditToggle.setAttribute('aria-label', tip);
 }
 applyAuditUi();
 
-if (btnAudit) {
-  btnAudit.addEventListener('click', () => {
+if (miAuditToggle) {
+  miAuditToggle.addEventListener('click', () => {
     state.auditEnabled = !state.auditEnabled;
     localStorage.setItem('excelmate.auditEnabled', String(state.auditEnabled));
     applyAuditUi();
+    setMenu(false);
   });
 }
 
 // Download audit trail as .md file. Backend renders on demand so the
 // hot path (/chat) never pays the full-file I/O cost.
-if (btnAuditDl) {
-  btnAuditDl.addEventListener('click', async () => {
+if (miAuditDl) {
+  miAuditDl.addEventListener('click', async () => {
+    setMenu(false);
     try {
-      const resp = await fetch('http://127.0.0.1:8000/audit/view');
+      const resp = await fetch(`${API_BASE}/audit/view`);
       if (!resp.ok) return;
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
@@ -80,12 +93,13 @@ if (btnAuditDl) {
   });
 }
 
-if (btnAuditClear) {
-  btnAuditClear.addEventListener('click', async () => {
+if (miAuditClear) {
+  miAuditClear.addEventListener('click', async () => {
+    setMenu(false);
     // No confirmation dialog — the audit history is the user's, deleting
     // it is a normal operation. Backend wipes both audit.jsonl and audit.md.
     try {
-      await fetch('http://127.0.0.1:8000/audit/clear', { method: 'POST' });
+      await fetch(`${API_BASE}/audit/clear`, { method: 'POST' });
     } catch {
       // Non-fatal: audit clear failures aren't worth interrupting the user.
     }
@@ -99,7 +113,7 @@ if (btnAuditClear) {
 async function postAuditDecision(requestId, toolIndex, decision, reason) {
   if (!requestId) return;          // pre-audit response or unknown request
   try {
-    await fetch('http://127.0.0.1:8000/audit/decision', {
+    await fetch(`${API_BASE}/audit/decision`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -193,6 +207,45 @@ if (chipReview) {
   chipReview.addEventListener('click', () => triggerReview());
 }
 
+// Variance Analysis chip — reads the Income Statement tab and hits /variance.
+// Like Review, it bypasses chat (it sources two-year data from a named sheet,
+// not the active selection).
+const chipVariance = document.getElementById('chip-variance');
+if (chipVariance) {
+  chipVariance.addEventListener('click', () => triggerVariance());
+}
+
+// Audit-tool "learn more" (ⓘ) — toggles the inline explainer below the row.
+// stopPropagation keeps the click off the row (which would run the report).
+// The demo video iframe is injected lazily on first open, and only if a
+// data-video id has been set — otherwise the "coming soon" placeholder stays.
+document.querySelectorAll('.audit-tool-info-btn').forEach(btn => {
+  btn.addEventListener('click', e => {
+    e.stopPropagation();
+    const info = btn.closest('.audit-tool-wrap')?.querySelector('.audit-tool-info');
+    if (!info) return;
+    const opening = info.hidden;
+    info.hidden = !opening;
+    btn.setAttribute('aria-expanded', String(opening));
+    if (opening) loadToolVideo(info);
+  });
+});
+
+function loadToolVideo(info) {
+  const slot = info.querySelector('.audit-tool-video');
+  if (!slot || slot.dataset.loaded) return;
+  const id = (slot.dataset.video || '').trim();
+  if (!id) return;                       // no video yet — keep the placeholder
+  slot.dataset.loaded = '1';
+  const iframe = document.createElement('iframe');
+  iframe.src = `https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}`;
+  iframe.title = 'Demo video';
+  iframe.allow = 'accelerometer; clipboard-write; encrypted-media; picture-in-picture';
+  iframe.allowFullscreen = true;
+  slot.innerHTML = '';
+  slot.appendChild(iframe);
+}
+
 clearSelBtn.addEventListener('click', () => {
   state.selectionContext = null;
   selPill.classList.remove('visible');
@@ -208,9 +261,9 @@ btnClear.addEventListener('click', () => {
   const log = document.getElementById('verify-log');
   if (log) {
     log.querySelectorAll('.verify-entry').forEach(e => e.remove());
-    const empty = document.getElementById('verify-empty');
-    if (empty) empty.style.display = '';
   }
+  // Hide the panel again — with no entries it shouldn't take up space.
+  if (panelVerify) panelVerify.style.display = 'none';
   state.verifyCount = 0;
   const counter = document.getElementById('verify-count');
   if (counter) counter.textContent = '0 checks';
@@ -289,7 +342,11 @@ function createMessageEl(role, content) {
 
   const avatar = document.createElement('div');
   avatar.className = `msg-avatar ${role === 'user' ? 'usr' : 'ai'}`;
-  avatar.textContent = role === 'user' ? 'U' : 'C';
+  if (role === 'user') {
+    avatar.textContent = 'U';
+  } else {
+    avatar.innerHTML = '<img src="../../assets/cat-head.png" alt="" />';
+  }
 
   const body = document.createElement('div');
   body.className = 'msg-body';
@@ -331,10 +388,7 @@ function createTypingEl() {
   wrap.className = 'message ai typing-indicator';
   wrap.innerHTML = `
     <div class="msg-avatar ai" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M14 9V5a3 3 0 0 0-3-3l-1 4-3 3v11h9a2 2 0 0 0 2-2l1-7a2 2 0 0 0-2-2h-3z"/>
-        <path d="M7 22H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1h3"/>
-      </svg>
+      <img src="../../assets/cat-head.png" alt="" />
     </div>
     <div class="msg-body">
       <div class="msg-role ai">ExcelCat AI</div>
@@ -458,9 +512,9 @@ function appendVerifyLog(toolCall, approvalId) {
     ${msgHtml ? `<div class="verify-entry-msg">${msgHtml}</div>` : ''}
   `;
 
-  // Hide empty state on first entry.
-  const empty = document.getElementById('verify-empty');
-  if (empty) empty.style.display = 'none';
+  // Reveal the panel the first time a check arrives (it's hidden by default
+  // so it doesn't take up space before anything happens).
+  if (panelVerify) panelVerify.style.display = '';
 
   log.appendChild(entry);
   // Auto-scroll so the newest entry is visible.
@@ -610,10 +664,7 @@ function renderApprovalCard(toolCall, approvalId) {
   wrap.dataset.approvalId = approvalId;
   wrap.innerHTML = `
     <div class="msg-avatar ai" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M14 9V5a3 3 0 0 0-3-3l-1 4-3 3v11h9a2 2 0 0 0 2-2l1-7a2 2 0 0 0-2-2h-3z"/>
-        <path d="M7 22H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1h3"/>
-      </svg>
+      <img src="../../assets/cat-head.png" alt="" />
     </div>
     <div class="msg-body">
       <div class="msg-role ai">ExcelCat AI · proposed change</div>
@@ -888,7 +939,7 @@ async function getAIResponse(userText) {
   const timeout = setTimeout(() => controller.abort(), 90_000);
 
   try {
-    const response = await fetch('http://127.0.0.1:8000/chat', {
+    const response = await fetch(`${API_BASE}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -984,7 +1035,7 @@ async function triggerReview() {
   showTyping();
 
   try {
-    const resp = await fetch('http://127.0.0.1:8000/review', {
+    const resp = await fetch(`${API_BASE}/review`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1078,7 +1129,7 @@ function renderReviewReport(data) {
   const wrap = document.createElement('div');
   wrap.className = 'message ai';
   wrap.innerHTML = `
-    <div class="msg-avatar ai" aria-hidden="true">C</div>
+    <div class="msg-avatar ai" aria-hidden="true"><img src="../../assets/cat-head.png" alt="" /></div>
     <div class="msg-body">
       <div class="msg-role ai">ExcelCat AI · assumption review</div>
       <div class="review-report">
@@ -1091,6 +1142,257 @@ function renderReviewReport(data) {
       </div>
     </div>
   `;
+  messagesEl.appendChild(wrap);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// ── Variance Analysis ──────────────────────────────────
+// Read a worksheet's used range by trying a list of candidate names (the
+// statement tab can be called "IS", "Income Statement", "P&L", …). Returns
+// { name, address, values, formulas } for the first match, or null if no
+// candidate sheet exists / they're all empty. Unlike refreshSelection() this
+// reads a NAMED sheet, not the active selection — variance needs the whole
+// statement regardless of what the user has clicked.
+async function readSheetByName(candidates) {
+  let found = null;
+  try {
+    await Excel.run(async ctx => {
+      const sheets = ctx.workbook.worksheets;
+      const probes = candidates.map(name => {
+        const ws = sheets.getItemOrNullObject(name);
+        const used = ws.getUsedRangeOrNullObject(true);
+        ws.load(['name', 'isNullObject']);
+        used.load(['address', 'values', 'formulas', 'isNullObject']);
+        return { ws, used };
+      });
+      await ctx.sync();
+      for (const p of probes) {
+        if (!p.ws.isNullObject && !p.used.isNullObject) {
+          const addr = p.used.address.includes('!')
+            ? p.used.address.split('!')[1]
+            : p.used.address;
+          found = { name: p.ws.name, address: addr, values: p.used.values, formulas: p.used.formulas };
+          break;
+        }
+      }
+    });
+  } catch {
+    // Demo / no Office — leave found null; the caller surfaces a message.
+  }
+  return found;
+}
+
+const IS_SHEET_NAMES = [
+  'IS', 'Income Statement', 'Income statement', 'income statement',
+  'P&L', 'P & L', 'Profit and Loss', 'Profit & Loss', 'PnL', 'P and L',
+];
+
+async function triggerVariance() {
+  let sheet = null;
+  try {
+    sheet = await readSheetByName(IS_SHEET_NAMES);
+  } catch {
+    sheet = null;
+  }
+  if (!sheet) {
+    addMessage('assistant', 'I couldn’t find an Income Statement tab. Rename the relevant sheet to "IS" or "Income Statement" and try again.');
+    return;
+  }
+  // Establish materiality first (audit discipline): ask for the clearly-trivial
+  // threshold, pre-filled with a suggestion, then run once the user confirms.
+  const suggested = suggestTrivialThreshold(sheet.values);
+  promptMateriality(suggested, sheet.name, trivial => runVariance(sheet, trivial));
+}
+
+// Heuristic suggested threshold ≈ 1% of the largest figure in the sheet (a
+// revenue proxy), rounded to one significant figure. Only a suggestion — the
+// user can overwrite it in the prompt.
+function suggestTrivialThreshold(values) {
+  let max = 0;
+  for (const row of values || []) {
+    for (const v of row) {
+      if (typeof v === 'number' && isFinite(v)) {
+        const a = Math.abs(v);
+        if (a > max) max = a;
+      }
+    }
+  }
+  if (max <= 0) return 0;
+  const raw = max * 0.01;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  return Math.round(raw / mag) * mag;
+}
+
+// Inline prompt card: a number input pre-filled with `suggested` + a Run button.
+// We avoid window.prompt() — it's unreliable in the Office webview. onRun fires
+// once, when the user clicks Run (or presses Enter).
+function promptMateriality(suggested, sheetName, onRun) {
+  if (messagesEl.contains(emptyState)) messagesEl.removeChild(emptyState);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'message ai';
+  wrap.innerHTML = `
+    <div class="msg-avatar ai" aria-hidden="true"><img src="../../assets/cat-head.png" alt="" /></div>
+    <div class="msg-body">
+      <div class="msg-role ai">ExcelCat AI · materiality</div>
+      <div class="materiality-prompt">
+        <div class="mat-title">Set clearly-trivial threshold${sheetName ? ' · ' + escapeHtml(sheetName) : ''}</div>
+        <div class="mat-help">Line items whose absolute change is smaller than this are treated as trivial and excluded. In the sheet’s own units; suggested ≈ 1% of the largest figure.</div>
+        <div class="mat-row">
+          <input type="number" class="mat-input" value="${suggested}" min="0" step="any" />
+          <button class="mat-run" type="button">Run analysis</button>
+        </div>
+      </div>
+    </div>`;
+
+  const input = wrap.querySelector('.mat-input');
+  const btn = wrap.querySelector('.mat-run');
+  const go = () => {
+    const v = parseFloat(input.value);
+    const threshold = (isFinite(v) && v > 0) ? v : 0;
+    btn.disabled = true;
+    input.disabled = true;
+    btn.textContent = threshold > 0 ? `Running (trivial < ${threshold.toLocaleString('en-GB')})` : 'Running…';
+    onRun(threshold);
+  };
+  btn.addEventListener('click', go);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+
+  messagesEl.appendChild(wrap);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  input.focus();
+  input.select();
+}
+
+async function runVariance(sheet, clearlyTrivial) {
+  state.isTyping = true;
+  sendBtn.disabled = true;
+  showTyping();
+  const stop = () => { state.isTyping = false; sendBtn.disabled = false; hideTyping(); };
+
+  try {
+    const resp = await fetch(`${API_BASE}/variance`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        values: sheet.values,
+        formulas: sheet.formulas,
+        address: `${sheet.name}!${sheet.address}`,
+        sheet: sheet.name,
+        clearly_trivial: clearlyTrivial,
+        model: state.selectedModel,
+        audit_enabled: state.auditEnabled,
+      }),
+    });
+
+    stop();
+    if (!resp.ok) throw new Error(`Server error: ${resp.status}`);
+    const data = await resp.json();
+    renderVarianceReport(data, sheet.name);
+  } catch (err) {
+    stop();
+    addMessage('assistant', `⚠️ Variance analysis failed: ${err.message}`);
+  }
+}
+
+function renderVarianceReport(data, sheetName) {
+  const table = data.variance_table || [];
+  const anomalies = data.anomalies || [];
+  const questions = data.cfo_questions || [];
+  const summary = data.summary || '';
+  const curLabel = data.current_label || 'Current';
+  const priorLabel = data.prior_label || 'Prior';
+
+  if (messagesEl.contains(emptyState)) messagesEl.removeChild(emptyState);
+
+  const fmtNum = n => (typeof n === 'number' && isFinite(n))
+    ? n.toLocaleString('en-GB', { maximumFractionDigits: 2 }) : '—';
+  const fmtPct = p => (typeof p === 'number' && isFinite(p))
+    ? `${p >= 0 ? '+' : ''}${(p * 100).toFixed(1)}%` : 'n/a';
+
+  // Badge: anomalies → orange; computed-but-clean → green; nothing → neutral.
+  let badgeClass, badgeLabel;
+  if (anomalies.length) {
+    badgeClass = 'has-issues';
+    badgeLabel = `${anomalies.length} anomal${anomalies.length > 1 ? 'ies' : 'y'}`;
+  } else if (table.length) {
+    badgeClass = 'clean';
+    badgeLabel = '✓ No anomalies';
+  } else {
+    badgeClass = 'none';
+    badgeLabel = 'Nothing to analyse';
+  }
+
+  const rowsHtml = table.map(r => {
+    const neg = (typeof r.abs_delta === 'number' && r.abs_delta < 0);
+    const dir = neg ? 'neg' : 'pos';
+    const noBase = r.flags && r.flags.includes('no_prior_base');
+    const pctCell = noBase ? 'new' : fmtPct(r.pct_delta);
+    const tag = r.trivial ? ' <span class="vt-tag">trivial</span>' : '';
+    return `
+      <tr class="${r.trivial ? 'vt-trivial' : ''}">
+        <td class="vt-label">${escapeHtml(r.label)}${tag}</td>
+        <td class="vt-num">${fmtNum(r.prior)}</td>
+        <td class="vt-num">${fmtNum(r.current)}</td>
+        <td class="vt-num ${dir}">${(typeof r.abs_delta === 'number' && r.abs_delta >= 0) ? '+' : ''}${fmtNum(r.abs_delta)}</td>
+        <td class="vt-num ${dir}">${pctCell}</td>
+      </tr>`;
+  }).join('');
+
+  const tableHtml = table.length ? `
+    <table class="variance-table">
+      <thead><tr>
+        <th>Line item</th><th>${escapeHtml(priorLabel)}</th><th>${escapeHtml(curLabel)}</th><th>Δ</th><th>Δ%</th>
+      </tr></thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>` : '';
+
+  // Materiality line: what threshold was applied and how many lines it set aside.
+  const threshold = data.clearly_trivial || 0;
+  const nTrivial = table.filter(r => r.trivial).length;
+  const materialityHtml = threshold > 0
+    ? `<div class="variance-materiality">Clearly-trivial threshold: ${threshold.toLocaleString('en-GB')} · ${nTrivial} line${nTrivial !== 1 ? 's' : ''} set aside as trivial</div>`
+    : '';
+
+  // Skipped lines: located as line items but non-numeric in one or both years,
+  // so no delta was computed. The audit log records them; the UI must say so
+  // too — silently dropping rows would undercut the audit story.
+  const skipped = data.skipped || [];
+  const skippedHtml = skipped.length
+    ? `<div class="variance-skipped">${skipped.length} line item${skipped.length !== 1 ? 's' : ''} skipped (non-numeric value in one or both years): ${escapeHtml(skipped.map(s => s.label).filter(Boolean).join(', '))}</div>`
+    : '';
+
+  const anomaliesHtml = anomalies.map(a => `
+    <div class="review-report-item warning">
+      <div class="review-report-item-label">⚠️ ${escapeHtml(a.title || 'Anomaly')}</div>
+      <div class="review-report-item-msg">${escapeHtml(a.detail || '')}</div>
+    </div>`).join('');
+
+  const questionsHtml = questions.length ? `
+    <div class="variance-cfo">
+      <div class="variance-cfo-title">Questions for CFO</div>
+      <ul>${questions.map(q => `<li>${escapeHtml(q)}</li>`).join('')}</ul>
+    </div>` : '';
+
+  const bodyHtml = (tableHtml || materialityHtml || skippedHtml || anomaliesHtml || questionsHtml)
+    ? `<div class="review-report-body">${tableHtml}${materialityHtml}${skippedHtml}${anomaliesHtml}${questionsHtml}</div>`
+    : '';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'message ai';
+  wrap.innerHTML = `
+    <div class="msg-avatar ai" aria-hidden="true"><img src="../../assets/cat-head.png" alt="" /></div>
+    <div class="msg-body">
+      <div class="msg-role ai">ExcelCat AI · variance analysis${sheetName ? ' · ' + escapeHtml(sheetName) : ''}</div>
+      <div class="review-report">
+        <div class="review-report-head">
+          <div class="review-report-title">Variance Analysis</div>
+          <div class="review-report-badge ${badgeClass}">${badgeLabel}</div>
+        </div>
+        ${bodyHtml}
+        ${summary ? `<div class="review-report-summary">${escapeHtml(summary)}</div>` : ''}
+      </div>
+    </div>`;
   messagesEl.appendChild(wrap);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }

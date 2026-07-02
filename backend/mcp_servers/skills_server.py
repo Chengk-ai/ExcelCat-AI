@@ -34,6 +34,15 @@ ACTION_SKILL_FILE_MAP = {
     "forecast_data": "forecast.md",
 }
 
+# Endpoint skills: served as a contract but NOT intent-routed via /chat. The
+# capability is triggered by a dedicated endpoint/chip (like Review), so these
+# names are deliberately kept OUT of list_skills() — that keeps the /chat routing
+# cache (skill_text_names / skill_action_names) clean. The contract still lives in
+# one file so the audit story holds.
+ENDPOINT_SKILL_FILE_MAP = {
+    "variance_analysis": "variance_analysis.md",
+}
+
 mcp = FastMCP("excelcat-skills")
 
 
@@ -58,6 +67,9 @@ def get_skill(tool_name: str) -> dict:
     if tool_name in ACTION_SKILL_FILE_MAP:
         filename = ACTION_SKILL_FILE_MAP[tool_name]
         return {"kind": "action", "filename": filename, "content": _read(filename)}
+    if tool_name in ENDPOINT_SKILL_FILE_MAP:
+        filename = ENDPOINT_SKILL_FILE_MAP[tool_name]
+        return {"kind": "endpoint", "filename": filename, "content": _read(filename)}
     return {"kind": None, "filename": None, "content": None}
 
 
