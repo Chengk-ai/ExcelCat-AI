@@ -4,9 +4,10 @@ LLM client layer — the single home for "talking to a model".
 Extracted from main.py (Phase 3 of the MCP refactor) so that BOTH the FastAPI
 orchestrator (main.py) and the excelcat-verify MCP server (mcp_servers/
 verify_server.py, which runs the reflexion loop) share one implementation
-instead of duplicating it. Owns: model config + clients, the function-calling
-tool registry (single source of truth), and the _call_deepseek / _call_model
-transport. No audit, no orchestration — those stay in main.py.
+instead of duplicating it. Owns: the model registry (routing key → provider +
+real model id), the function-calling tool registry (single source of truth),
+and the _call_openai_compat / _call_model transport. No audit, no
+orchestration — those stay in main.py.
 
 load_dotenv is called here with an explicit path so the module works regardless
 of which process imports it or what its cwd is (the MCP server is a subprocess).
@@ -23,10 +24,53 @@ from google.genai import types
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-# ── Config ────────────────────────────────────────────────
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+# ── Model registry ────────────────────────────────────────
+# Single source of truth for every model the product can offer. The KEY is the
+# routing key — what the frontend dropdown sends and what travels through the
+# API. `model_id` is what actually goes on the wire; the audit trail must
+# record model_id (recording only the routing key would let a .env override
+# silently misattribute outputs). Adding a model = one entry here + one
+# <option> in taskpane.html.
+#
+# provider:
+#   "openai_compat" — OpenAI-style /chat/completions (DeepSeek, OpenAI, and any
+#                     compatible vendor); needs base_url + api_key_env.
+#   "gemini"        — Google GenAI SDK.
+# temperature is optional — omitted means "don't send it" (some GPT-5.x models
+# reject the parameter).
+MODEL_REGISTRY = {
+    "gemini-2.5-flash": {
+        "provider": "gemini",
+        "model_id": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        "label": "Gemini 2.5 Flash",
+    },
+    "deepseek-v4-flash": {
+        "provider": "openai_compat",
+        "model_id": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "label": "DeepSeek V4 Flash",
+        "temperature": 0.2,
+    },
+    "gpt-5.4-mini": {
+        "provider": "openai_compat",
+        "model_id": os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
+        "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        "api_key_env": "OPENAI_API_KEY",
+        "label": "GPT-5.4 mini",
+    },
+}
+
+# Primary swapped to Gemini (July 2026): DeepSeek's latency kept tripping the
+# frontend's 90s /chat timeout on long reflexion chains; Gemini rarely does.
+# DeepSeek stays selectable as the fallback.
+DEFAULT_MODEL = "gemini-2.5-flash"
+
+
+def resolve_model_id(selected_model: str) -> str:
+    """The real on-the-wire model id for a routing key — audit records THIS."""
+    entry = MODEL_REGISTRY.get(selected_model)
+    return entry["model_id"] if entry else selected_model
 
 # Gemini is the FALLBACK model, so a missing key must not stop DeepSeek-primary
 # operation — and this module is imported by main.py AND the MCP servers, so a
@@ -41,7 +85,13 @@ def _get_gemini_client() -> genai.Client:
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not configured in backend/.env")
-        _gemini_client = genai.Client(api_key=api_key)
+        # 30s per call (HttpOptions.timeout is in MILLISECONDS). Without this
+        # the SDK waits indefinitely — a hung Gemini call was the "spinner
+        # never stops" failure mode on /review and /variance.
+        _gemini_client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=30_000),
+        )
     return _gemini_client
 
 
@@ -235,22 +285,29 @@ FORECAST_ONLY_TOOLS = {
 
 
 # ── Transport ─────────────────────────────────────────────
-# One shared client so every DeepSeek call reuses pooled connections instead of
-# paying a fresh TCP+TLS handshake — a single /chat round with reflexion can
-# make 5-8 sequential calls. Lives for the process lifetime; no explicit close.
-_http_client = httpx.AsyncClient(timeout=60)
+# One shared client so every OpenAI-compat call reuses pooled connections
+# instead of paying a fresh TCP+TLS handshake — a single /chat round with
+# reflexion can make several calls. Lives for the process lifetime; no explicit
+# close. 30s per call: the frontend gives /chat 90s in total, so one slow call
+# must not be allowed to eat two-thirds of that budget.
+_http_client = httpx.AsyncClient(timeout=30)
 
 
-async def _call_deepseek(
-    model: str,
+async def _call_openai_compat(
+    entry: dict,
     user_content: str,
     system_instruction: Optional[str] = None,
     use_tools: bool = False,
     tools_override: Optional[list] = None,
 ) -> dict:
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    """Transport for any OpenAI-style /chat/completions vendor (DeepSeek, OpenAI…).
+
+    `entry` is a MODEL_REGISTRY value: model_id, base_url, api_key_env, label,
+    optional temperature. The API key is resolved per call so a missing key only
+    fails the model that needs it (fail-loud, per capability)."""
+    api_key = os.getenv(entry["api_key_env"])
     if not api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY is not configured in backend/.env")
+        raise RuntimeError(f"{entry['api_key_env']} is not configured in backend/.env")
 
     messages = []
     if system_instruction:
@@ -258,17 +315,18 @@ async def _call_deepseek(
     messages.append({"role": "user", "content": user_content})
 
     payload = {
-        "model": model,
+        "model": entry["model_id"],
         "messages": messages,
-        "temperature": 0.2,
     }
+    if "temperature" in entry:
+        payload["temperature"] = entry["temperature"]
     if use_tools:
         payload["tools"] = tools_override or OPENAI_TOOLS
         payload["tool_choice"] = "auto"
 
     try:
         resp = await _http_client.post(
-            f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions",
+            f"{entry['base_url'].rstrip('/')}/chat/completions",
             json=payload,
             headers={
                 "Content-Type": "application/json",
@@ -279,7 +337,7 @@ async def _call_deepseek(
         data = resp.json()
     except httpx.HTTPStatusError as e:
         body = e.response.text
-        raise RuntimeError(f"DeepSeek API error {e.response.status_code}: {body}") from e
+        raise RuntimeError(f"{entry['label']} API error {e.response.status_code}: {body}") from e
 
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -312,12 +370,18 @@ async def _call_model(
     # call. Shape: {"openai": [...openai tool dicts...], "gemini": types.Tool}.
     # Used by the forecast second pass to expose only apply_forecast.
     #
-    # Future GPT/OpenAI models plug in here: add a branch that reuses OPENAI_TOOLS
-    # (the canonical JSON-Schema list) directly — no new tool definitions needed,
-    # only a client call. Only Gemini ever needs the _to_gemini_tool() adapter.
-    if selected_model == "deepseek-v4-flash":
-        return await _call_deepseek(
-            model=DEEPSEEK_MODEL,
+    # Dispatch is registry-driven: the routing key resolves to a provider and a
+    # real model id. Only Gemini needs the _to_gemini_tool() adapter; every
+    # OpenAI-compatible vendor shares one transport and OPENAI_TOOLS as-is.
+    entry = MODEL_REGISTRY.get(selected_model)
+    if entry is None:
+        raise RuntimeError(
+            f"Unknown model '{selected_model}' — add it to MODEL_REGISTRY in llm_client.py"
+        )
+
+    if entry["provider"] == "openai_compat":
+        return await _call_openai_compat(
+            entry,
             user_content=user_content,
             system_instruction=system_instruction,
             use_tools=use_tools,
@@ -338,7 +402,7 @@ async def _call_model(
 
     def _gemini_sync():
         return _get_gemini_client().models.generate_content(
-            model=GEMINI_MODEL,
+            model=entry["model_id"],
             contents=[user_content],
             config=config,
         )

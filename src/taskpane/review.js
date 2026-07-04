@@ -15,6 +15,12 @@ export async function triggerReview() {
   sendBtn.disabled = true;
   showTyping();
 
+  // 45s timeout — review is deterministic (no LLM), so anything this slow
+  // means the backend is wedged; surface an error rather than leaving the
+  // typing indicator spinning forever.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 45_000);
+
   try {
     const resp = await fetch(`${API_BASE}/review`, {
       method: 'POST',
@@ -25,7 +31,9 @@ export async function triggerReview() {
         address: `${state.selectionContext.sheet}!${state.selectionContext.address}`,
         audit_enabled: state.auditEnabled,
       }),
+      signal: controller.signal,
     });
+    clearTimeout(timer);
 
     state.isTyping = false;
     sendBtn.disabled = false;
@@ -36,10 +44,14 @@ export async function triggerReview() {
     const data = await resp.json();
     renderReviewReport(data);
   } catch (err) {
+    clearTimeout(timer);
     state.isTyping = false;
     sendBtn.disabled = false;
     hideTyping();
-    addMessage('assistant', `⚠️ Review failed: ${err.message}`);
+    const msg = err.name === 'AbortError'
+      ? '⚠️ Review timed out (45s). The backend may be unresponsive — check it is running and try again.'
+      : `⚠️ Review failed: ${err.message}`;
+    addMessage('assistant', msg);
   }
 }
 
@@ -81,9 +93,15 @@ function renderReviewReport(data) {
 
   const paramChipsHtml = locatedEntries
     .map(([k, entries]) => {
-      const vals = entries.map(e =>
-        e.cell ? `${escapeHtml(e.value)} at ${escapeHtml(e.cell)}` : escapeHtml(e.value)
-      ).join(', ');
+      const vals = entries.map(e => {
+        let s = e.cell ? `${escapeHtml(e.value)} at ${escapeHtml(e.cell)}` : escapeHtml(e.value);
+        // Provenance marker (audit story: where did this number come from?).
+        // The backend sends null when the formulas grid couldn't say —
+        // definite answers only, no guessing.
+        if (e.hardcoded === true) s += ' · hardcoded';
+        else if (e.hardcoded === false) s += ' · formula';
+        return s;
+      }).join(', ');
       return `<span class="review-checked-param">${escapeHtml(k)} = ${vals}</span>`;
     });
   const rowChipsHtml = rowChips

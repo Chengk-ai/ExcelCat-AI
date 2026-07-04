@@ -10,7 +10,11 @@ if TYPE_CHECKING:
 @dataclass
 class RuleResult:
     rule_id: str
-    level: Literal["warning", "suggestion"]
+    # "info" is proof-of-work only: check_rules records the rule_id in
+    # checks_run but surfaces no message — it exists so the audit trail can
+    # tell "checked, fine" apart from "couldn't check". Rules' class-level
+    # `level` defaults stay warning/suggestion; info is per-result.
+    level: Literal["warning", "suggestion", "info"]
     message: str
 
 

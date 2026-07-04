@@ -10,16 +10,23 @@ import sys
 import re
 import json
 import uuid
+import asyncio
 from contextlib import asynccontextmanager, AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 import audit
 import audit_render
+# Deterministic per-column stats + IQR outlier candidates for the text-skill
+# pass — the skill contracts direct the model to quote figures from this block
+# instead of doing its own arithmetic (same lesson as analyse_data_state).
+from profile_stats import build_profile
 # LLM transport + tool registry now live in llm_client (shared with the
-# excelcat-verify MCP server, which runs the reflexion loop). main.py only needs
-# _call_model for the /chat passes and FORECAST_ONLY_TOOLS for the forecast pass.
-from llm_client import _call_model, FORECAST_ONLY_TOOLS
+# excelcat-verify MCP server, which runs the reflexion loop). main.py needs
+# _call_model for the /chat passes, FORECAST_ONLY_TOOLS for the forecast pass,
+# and DEFAULT_MODEL / resolve_model_id so routing and the audit trail agree on
+# which model actually ran.
+from llm_client import _call_model, FORECAST_ONLY_TOOLS, DEFAULT_MODEL, resolve_model_id
 
 # ── MCP servers ───────────────────────────────────────────
 # The MCP refactor splits backend-owned logic into stdio MCP servers, spawned
@@ -133,9 +140,9 @@ def _skills_unavailable_response(request_id: str, audit_enabled: bool) -> dict:
     }
 
 # ── Function calling + LLM transport moved to llm_client.py ──
-# The tool registry (OPENAI_TOOLS / tools / FORECAST_ONLY_TOOLS) and the
-# _call_deepseek / _call_model transport now live in llm_client.py, shared
-# with the excelcat-verify MCP server. Imported at the top of this file.
+# The tool registry (OPENAI_TOOLS / tools / FORECAST_ONLY_TOOLS), the model
+# registry, and the _call_openai_compat / _call_model transport now live in
+# llm_client.py, shared with the MCP servers. Imported at the top of this file.
 
 
 # ── Reflexion Pattern (critique → revise → re-verify, up to 3×) ──────────────
@@ -190,7 +197,7 @@ async def reflexion_review(
     context_str: str,
     max_iterations: int = 3,
     *,
-    selected_model: str = "deepseek-v4-flash",
+    selected_model: str = DEFAULT_MODEL,
     request_id: Optional[str] = None,
     audit_enabled: bool = True,
 ) -> dict:
@@ -255,9 +262,10 @@ async def pre_write_hook(
     context_str: str,
     context: Optional["SelectionContext"] = None,
     *,
-    selected_model: str = "deepseek-v4-flash",
+    selected_model: str = DEFAULT_MODEL,
     request_id: Optional[str] = None,
     audit_enabled: bool = True,
+    reflexion_cache: Optional[dict] = None,
 ) -> dict:
     """
     Runs checks on an action tool_call before it's returned to the frontend
@@ -313,22 +321,39 @@ async def pre_write_hook(
     # SUGGESTION — not an automatic replacement. The user decides on the
     # approval card whether to keep their original, accept the AI's version,
     # or reject entirely.
+    # Dedupe: formulas that reduce to the same row-template share ONE reflexion
+    # run per request. `reflexion_cache` maps template → {row, task}; the memo
+    # stores the in-flight asyncio task, so concurrent hooks (the gather in
+    # chat_endpoint) join the same run instead of launching their own. One
+    # reflexion_run audit event is emitted per actual run; reused checks are
+    # recorded as formula_correctness_reused in each tool's hook_check event,
+    # so the trail stays honest about what was recomputed vs shared.
     if tool_call["name"] == "write_to_cell":
         original = tool_call.get("args", {}).get("value", "")
         if original and contains_formula(original):
-            checks_run.append("formula_correctness")
-            print(f"[HOOK] Running formula check on: {original}")
-            review_meta = await reflexion_review(
-                original,
-                enriched_context,
-                selected_model=selected_model,
-                request_id=request_id,
-                audit_enabled=audit_enabled,
-            )
-
-            # Reflexion may wrap its output in prose ("Here is the fixed
-            # formula: =B1+B10"). Pull out the formula token for a clean diff.
-            ai_version = _extract_formula(review_meta["final_reply"])
+            parsed = _parse_cell(tool_call.get("args", {}).get("cell", ""))
+            row = parsed[1] if parsed else 0
+            template = _row_template(original, row) if parsed else original
+            entry = reflexion_cache.get(template) if reflexion_cache is not None else None
+            reused = entry is not None
+            if not reused:
+                print(f"[HOOK] Running formula check on: {original}")
+                entry = {
+                    "row": row,
+                    "task": asyncio.ensure_future(reflexion_review(
+                        original,
+                        enriched_context,
+                        selected_model=selected_model,
+                        request_id=request_id,
+                        audit_enabled=audit_enabled,
+                    )),
+                }
+                if reflexion_cache is not None:
+                    reflexion_cache[template] = entry
+            checks_run.append("formula_correctness_reused" if reused else "formula_correctness")
+            review_meta = await entry["task"]
+            if reused:
+                review_meta = {**review_meta, "reused": True}
 
             if not review_meta["verified"]:
                 # Reflexion couldn't even fix it — hard warning.
@@ -336,16 +361,24 @@ async def pre_write_hook(
                     f"Formula did not pass verification after "
                     f"{review_meta['iterations']} attempts — please review manually."
                 )
-            elif ai_version and _normalise_formula(ai_version) != _normalise_formula(original):
-                # Verified, but the AI changed something. Surface as a
-                # suggestion so the user can compare on the approval card.
-                print(f"[HOOK] AI suggests: {ai_version} (original: {original})")
-                suggestions.append({
-                    "field": "value",
-                    "original": original,
-                    "suggested": ai_version,
-                    "reason": _first_critique(review_meta["log"]),
-                })
+            else:
+                # Reflexion may wrap its output in prose ("Here is the fixed
+                # formula: =B1+B10"). Pull out the formula token for a clean
+                # diff. The shared run reviewed the FIRST tool's formula, so
+                # the diff happens at TEMPLATE level — a row-blind string
+                # compare would emit a false suggestion for every other row —
+                # and the suggestion is re-instantiated for THIS tool's row.
+                ai_version = _extract_formula(review_meta["final_reply"])
+                ai_template = _row_template(ai_version, entry["row"]) if ai_version else ""
+                if ai_template and _normalise_formula(ai_template) != _normalise_formula(template):
+                    suggested = ai_template.replace("{r}", str(row)) if parsed else ai_template
+                    print(f"[HOOK] AI suggests: {suggested} (original: {original})")
+                    suggestions.append({
+                        "field": "value",
+                        "original": original,
+                        "suggested": suggested,
+                        "reason": _first_critique(review_meta["log"]),
+                    })
 
     # ── Batch pattern: same check, but on the templated pattern instead
     # of N individual formulas. We instantiate a sample by replacing {r}
@@ -748,7 +781,9 @@ class SelectionContext(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     context: Optional[SelectionContext] = None
-    model: Optional[Literal["gemini-2.5-flash", "deepseek-v4-flash"]] = "deepseek-v4-flash"
+    # Routing key into llm_client's MODEL_REGISTRY; None → DEFAULT_MODEL. Plain
+    # str (validated in _call_model) so adding a model needs no schema change.
+    model: Optional[str] = None
     # Per-request audit toggle. The frontend persists the user's choice in
     # localStorage and sends it on every /chat. When False, no audit events
     # are written and audit.jsonl is never touched.
@@ -787,13 +822,15 @@ class VarianceRequest(BaseModel):
     # Clearly-trivial materiality threshold (absolute, in the sheet's own units).
     # Line items whose change is below it are split out as immaterial. 0 = no filter.
     clearly_trivial: float = 0.0
-    model: Optional[Literal["gemini-2.5-flash", "deepseek-v4-flash"]] = "deepseek-v4-flash"
+    # Routing key into llm_client's MODEL_REGISTRY; None → DEFAULT_MODEL. Plain
+    # str (validated in _call_model) so adding a model needs no schema change.
+    model: Optional[str] = None
     audit_enabled: Optional[bool] = True
 
 # ── Main endpoint ─────────────────────────────────────────
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    selected_model = request.model or "deepseek-v4-flash"
+    selected_model = request.model or DEFAULT_MODEL
     audit_enabled = bool(request.audit_enabled)
 
     # Generate one request_id per /chat round. All events emitted during
@@ -832,7 +869,11 @@ async def chat_endpoint(request: ChatRequest):
             "chat_request",
             {
                 "user_message": last_user_message,
+                # Both identities: what the user picked (routing key) and what
+                # actually went on the wire — a .env override changes the
+                # latter, and the trail must not misattribute outputs.
                 "model": selected_model,
+                "model_id": resolve_model_id(selected_model),
                 "selection": sel_payload,
             },
             request_id=request_id,
@@ -928,9 +969,21 @@ async def chat_endpoint(request: ChatRequest):
             if skill_content:
                 skill_prompt += f"\n\n── SKILL INSTRUCTIONS (follow these precisely) ──\n{skill_content}"
 
+            # Deterministic data profile: computed over the FULL selection, so
+            # it also covers the rows the 100-row prompt truncation hides. ""
+            # when there's no selection/data — the contracts' fallback clauses
+            # ("if no profile is supplied…") handle that case.
+            profile_block = build_profile(
+                request.context.values if request.context else [],
+                request.context.address if request.context else "",
+            )
+            skill_user_content = final_user_message
+            if profile_block:
+                skill_user_content = f"{final_user_message}\n\n{profile_block}"
+
             skill_response = await _call_model(
                 selected_model=selected_model,
-                user_content=final_user_message,
+                user_content=skill_user_content,
                 system_instruction=skill_prompt,
                 use_tools=False,
             )
@@ -958,6 +1011,11 @@ async def chat_endpoint(request: ChatRequest):
                         "skill_used": True,
                         "tool_calls_proposed": [],
                         "reply_excerpt": ai_text[:400],
+                        # The exact computed facts the model was told to quote.
+                        # Without this, figures in a summary of a selection too
+                        # large for chat_request to record verbatim would have
+                        # no audit anchor.
+                        "data_profile": profile_block,
                     },
                     request_id=request_id,
                     enabled=audit_enabled,
@@ -1016,22 +1074,40 @@ async def chat_endpoint(request: ChatRequest):
         action_tools = _collapse_row_pattern_writes(action_tools)
 
         if action_tools:
-            # Run pre_write_hook on every action tool.
-            # Note: we do NOT block in the backend — check results are attached
-            # as metadata on each tool_call, and the frontend approval UI shows
-            # them to the user. The user makes the final call.
+            # Run pre_write_hook on every action tool — CONCURRENTLY. Hooks are
+            # independent per tool; the semaphore caps in-flight LLM work so a
+            # big batch doesn't hammer provider rate limits. The audit log's
+            # 209s case was 28 of these running back-to-back — gather turns the
+            # sum into (roughly) the max. gather() preserves input order, so
+            # card order and the tool_index ↔ approval_decision mapping stay
+            # stable; audit events from different tools interleave in time
+            # order, which is fine — the renderer groups by request_id.
+            # `reflexion_cache` dedupes reflexion across tools whose formulas
+            # reduce to the same row-template (N identical fills = 1 LLM loop).
+            #
+            # Note: we still do NOT block in the backend — check results are
+            # attached as metadata on each tool_call, and the frontend approval
+            # UI shows them to the user. The user makes the final call.
+            reflexion_cache: dict = {}
+            hook_sem = asyncio.Semaphore(4)
+
+            async def _run_hook(tool):
+                async with hook_sem:
+                    return await pre_write_hook(
+                        tool,
+                        context_str,
+                        context=request.context,
+                        selected_model=selected_model,
+                        request_id=request_id,
+                        audit_enabled=audit_enabled,
+                        reflexion_cache=reflexion_cache,
+                    )
+
+            hook_results = await asyncio.gather(*(_run_hook(t) for t in action_tools))
+
             enriched_tools = []
             all_checks = []
-
-            for tool in action_tools:
-                hook_result = await pre_write_hook(
-                    tool,
-                    context_str,
-                    context=request.context,
-                    selected_model=selected_model,
-                    request_id=request_id,
-                    audit_enabled=audit_enabled,
-                )
+            for tool, hook_result in zip(action_tools, hook_results):
                 all_checks.extend(hook_result["checks_run"])
 
                 # Attach hook result to the tool_call — frontend renders the
@@ -1286,15 +1362,22 @@ async def variance_endpoint(request: VarianceRequest):
     """
     audit_enabled = bool(request.audit_enabled)
     request_id = str(uuid.uuid4())
-    selected_model = request.model or "deepseek-v4-flash"
+    selected_model = request.model or DEFAULT_MODEL
 
     def _finish(result: dict, *, error=False) -> dict:
-        # Audit payload carries `address` + the materiality threshold that was
-        # applied, so the trail records what counted as trivial. The frontend
-        # response keeps the result shape. `error` is additive — only on a
-        # degraded path. (result may also echo clearly_trivial; it overrides and
-        # should match.)
-        payload = {"address": request.address, "clearly_trivial": request.clearly_trivial, **result}
+        # Audit payload carries `address`, the materiality threshold that was
+        # applied, and which model ran the passes (routing key + real model_id),
+        # so the trail records what counted as trivial and who said so. The
+        # frontend response keeps the result shape. `error` is additive — only
+        # on a degraded path. (result may also echo clearly_trivial; it
+        # overrides and should match.)
+        payload = {
+            "address": request.address,
+            "clearly_trivial": request.clearly_trivial,
+            "model": selected_model,
+            "model_id": resolve_model_id(selected_model),
+            **result,
+        }
         if error:
             payload["error"] = True
         audit.append_event(

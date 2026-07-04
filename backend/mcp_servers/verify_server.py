@@ -24,10 +24,10 @@ from typing import Any, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from llm_client import _call_model
+from llm_client import _call_model, DEFAULT_MODEL
 from rules import RULES, RULES_REVIEW
 from rules.base import ReviewContext
-from rules.financial.param_locator import locate_all, IS_PERCENTAGE
+from rules.financial.param_locator import locate_all, IS_PERCENTAGE, is_hardcoded
 from rules.financial.row_classifier import count_inspectable_cells
 from rules.financial.horizontal_formula_consistency import MIN_DATA_CELLS
 from rules.financial.hardcode_trend_anomaly import MIN_VALUES
@@ -77,7 +77,14 @@ def review_assumptions(
         found = locate_all(key, values, address)
         if found:
             located[label] = [
-                {"value": _fmt_review_value(key, p.value), "cell": p.cell}
+                {
+                    "value": _fmt_review_value(key, p.value),
+                    "cell": p.cell,
+                    # Provenance: True = typed constant, False = formula-driven,
+                    # None = couldn't tell (frontend renders a marker only for
+                    # definite answers).
+                    "hardcoded": is_hardcoded(formulas, p),
+                }
                 for p in found
             ]
 
@@ -190,7 +197,7 @@ async def verify_formula(
     original_reply: str,
     context_str: str,
     max_iterations: int = 3,
-    selected_model: str = "deepseek-v4-flash",
+    selected_model: str = DEFAULT_MODEL,
 ) -> dict:
     """Reflexion loop: critique → revise → re-verify (up to max_iterations).
 

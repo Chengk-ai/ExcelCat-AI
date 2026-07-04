@@ -21,6 +21,10 @@ class LocatedParam:
     value: float
     source: str
     cell: Optional[str] = None
+    # Grid-relative 0-based indices of the VALUE cell, so provenance checks can
+    # look up the matching formulas grid. None when unknown.
+    row: Optional[int] = None
+    col: Optional[int] = None
 
 
 # ── Keyword dictionaries ───────────────────────────────────────────────────────
@@ -183,6 +187,8 @@ def _find_in_labels(
                         value=_normalise_scale(float(val), is_pct),
                         source="label match",
                         cell=cell_str,
+                        row=row_idx,
+                        col=val_col,
                     ))
                     break
 
@@ -190,6 +196,24 @@ def _find_in_labels(
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
+
+def is_hardcoded(formulas: List[List[Any]], located: LocatedParam) -> Optional[bool]:
+    """Provenance of a located parameter: True = typed-in constant, False =
+    formula-driven, None = cannot tell (no formulas grid / indices missing).
+
+    The formulas grid (Office.js `range.formulas`) holds the formula string for
+    formula cells and the raw value otherwise, so "string starting with '='" is
+    the discriminator. Returns None rather than guessing, so downstream rules
+    never flag on evidence they don't have.
+    """
+    if located.row is None or located.col is None or not formulas:
+        return None
+    try:
+        f = formulas[located.row][located.col]
+    except (IndexError, TypeError):
+        return None
+    return not (isinstance(f, str) and f.strip().startswith("="))
+
 
 def locate_all(
     param: str,

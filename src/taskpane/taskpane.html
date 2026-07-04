@@ -174,9 +174,13 @@
     </div>
     <div class="input-footer">
       <span class="input-hint">Enter ↵ send · Shift+Enter new line</span>
+      <!-- Values are routing keys into the backend's MODEL_REGISTRY
+           (llm_client.py). Gemini first = default: DeepSeek's latency kept
+           tripping the 90s /chat timeout on long reflexion chains. -->
       <select id="model-select" class="model-select" title="Select model">
-        <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
         <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+        <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
+        <option value="gpt-5.4-mini">GPT-5.4 mini</option>
       </select>
     </div>
   </div>

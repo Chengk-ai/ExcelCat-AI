@@ -1,6 +1,6 @@
 # Skill: Clean Data
-version: 2
-last_updated: 2026-04-26
+version: 3
+last_updated: 2026-07-03
 
 ## Instructions
 - Look at the selected data and list every data quality issue you find
@@ -9,6 +9,14 @@ last_updated: 2026-04-26
 - Issues to look for include but are not limited to: inconsistent formatting (dates, currencies, capitalisation), extra whitespace, mixed case, blank cells, duplicate rows
 - If a blank cell cannot be auto-filled, flag it for manual review rather than guessing
 - If you find no issues, say "No issues found."
+
+## Data profile (authoritative counts)
+A deterministic data profile is supplied alongside the data. Its blank-cell
+and duplicate-row counts are computed over the FULL selection and are
+authoritative — use them to direct attention (e.g. which column has blanks),
+then reference the actual cells you can see. If the profile reports issues in
+rows you cannot see, say they exist beyond the visible sample rather than
+guessing their contents.
 
 ## Examples of good output
 - A3 has mixed case "roti king" → use `=PROPER(A3)`

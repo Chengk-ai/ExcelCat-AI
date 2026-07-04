@@ -49,6 +49,15 @@ class ForecastSanityRule(Rule):
                 source = "historical CAGR"
 
         if implied is None:
+            # Proof-of-work: the band check COULDN'T run (no explicit rate, no
+            # usable history). Without this marker, "checked and passed" and
+            # "never evaluated" would be indistinguishable in checks_run and
+            # in the audit trail.
+            results.append(RuleResult(
+                rule_id="forecast_sanity_skipped",
+                level="info",
+                message="",
+            ))
             return results
 
         if implied > self.MAX_ANNUAL_GROWTH or implied < self.MIN_ANNUAL_GROWTH:
@@ -62,4 +71,7 @@ class ForecastSanityRule(Rule):
                     f"this projection is intended."
                 ),
             ))
+        else:
+            # In band — record the pass explicitly (proof-of-work).
+            results.append(RuleResult(rule_id=self.id, level="info", message=""))
         return results

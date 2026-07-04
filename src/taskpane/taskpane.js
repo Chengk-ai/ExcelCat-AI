@@ -10,7 +10,7 @@ import {
 } from './core';
 import { setMenu, applyAuditUi } from './audit';
 import { refreshSelection } from './excel';
-import { renderMessages, copyMsg } from './messages';
+import { renderMessages, copyMsg, addMessage } from './messages';
 import { handleSend } from './chat';
 import {
   approveToolCall, useAISuggestion, rejectToolCall,
@@ -19,11 +19,11 @@ import {
 import { triggerReview } from './review';
 import { triggerVariance } from './variance';
 
-state.selectedModel = 'deepseek-v4-flash';
+state.selectedModel = 'gemini-2.5-flash';
 
 if (modelSelect) {
   modelSelect.addEventListener('change', (e) => {
-    state.selectedModel = e.target.value || 'deepseek-v4-flash';
+    state.selectedModel = e.target.value || 'gemini-2.5-flash';
   });
 }
 
@@ -121,6 +121,13 @@ sendBtn.addEventListener('click', handleSend);
 // ── Quick action chips ─────────────────────────────────
 document.querySelectorAll('.chip[data-prompt]').forEach(chip => {
   chip.addEventListener('click', () => {
+    // No selection → the round-trip would only come back with "please select
+    // some data first". Say it locally instead (saves a wasted LLM call), but
+    // still stage the prompt so the user can select a range and just press
+    // Enter. Non-blocking: sending anyway remains the user's choice.
+    if (!state.selectionContext) {
+      addMessage('assistant', 'Please select a data range in Excel first — the prompt is staged in the box, press Enter once you have.');
+    }
     chatInput.value = chip.dataset.prompt;
     chatInput.dispatchEvent(new Event('input'));
     chatInput.focus();
