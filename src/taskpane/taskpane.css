@@ -1377,3 +1377,54 @@ html, body {
 }
 .mat-run:hover:not(:disabled) { background: rgba(45,212,191,0.2); }
 .mat-run:disabled { opacity: 0.6; cursor: default; }
+
+/* ── Variance Phase 2: tie-out checks, statement sections, ratios ── */
+
+/* Checks: deterministic identity verifications, shown with residuals.
+   Vocabulary discipline — these are "checks", Pass B findings are "anomalies". */
+.variance-checks {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  border-left: 3px solid rgba(45,212,191,0.6);
+  padding: 6px 10px;
+  border-radius: 0 6px 6px 0;
+  background: var(--surface);
+}
+.variance-checks-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #0f9488;
+  margin-bottom: 4px;
+}
+.vt-check {
+  display: flex;
+  gap: 6px;
+  padding: 1px 0;
+  line-height: 1.45;
+}
+.vt-check-icon { flex: 0 0 auto; width: 12px; text-align: center; }
+.vt-check-icon.pass    { color: var(--accent2); }
+.vt-check-icon.fail    { color: #ef5e6e; }
+.vt-check-icon.info    { color: #5b9cf6; }
+.vt-check-icon.skipped { color: var(--text-muted); }
+.vt-check-label { color: var(--text); font-weight: 500; }
+.vt-check-detail { color: var(--text-muted); }
+
+/* Statement section headings (shown in dual-statement mode + above ratios). */
+.variance-stmt-head {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  margin: 6px 0 0;
+}
+
+/* Click-to-highlight: rows that can select their source cells in Excel. */
+.variance-table tbody tr.vt-click { cursor: pointer; }
+.variance-table tbody tr.vt-click:hover td { background: rgba(45,212,191,0.07); }
+
+/* Ratio basis line (e.g. "Receivables ÷ Revenue × 365") under each ratio label. */
+.vr-basis { font-size: 9.5px; color: var(--text-muted); font-weight: 400; }

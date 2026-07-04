@@ -92,3 +92,21 @@ export const IS_SHEET_NAMES = [
   'IS', 'Income Statement', 'Income statement', 'income statement',
   'P&L', 'P & L', 'Profit and Loss', 'Profit & Loss', 'PnL', 'P and L',
 ];
+
+export const BS_SHEET_NAMES = [
+  'BS', 'Balance Sheet', 'Balance sheet', 'balance sheet',
+  'SOFP', 'Statement of Financial Position', 'Statement of financial position',
+];
+
+// Activate a sheet and select a range (e.g. "C5:E5"). Used by the variance
+// report's click-to-highlight: clicking a table row selects the source cells
+// so a figure can be verified where it actually lives. Throws on failure —
+// callers swallow it (a click that does nothing beats a crash).
+export async function selectRangeOnSheet(sheetName, rangeAddress) {
+  await Excel.run(async ctx => {
+    const sheet = ctx.workbook.worksheets.getItem(sheetName);
+    sheet.activate();
+    sheet.getRange(rangeAddress).select();
+    await ctx.sync();
+  });
+}

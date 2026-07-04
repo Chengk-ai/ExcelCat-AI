@@ -70,7 +70,12 @@ def compute_variance(
     This is the audit "clearly trivial" concept — the split is deterministic
     here, not an LLM judgement. 0 (the default) means nothing is trivial.
 
-    Returns {current_label, prior_label, clearly_trivial, rows, skipped[, error]}.
+    Each returned row carries its 0-based grid `row` index, and the result
+    carries `current_col`/`prior_col`, so every figure can be traced back to
+    the actual cells (frontend click-to-highlight, tie-out cell references).
+
+    Returns {current_label, prior_label, clearly_trivial, current_col,
+    prior_col, rows, skipped[, error]}.
     """
     current_label = str(mapping.get("current_label", "") or "")
     prior_label = str(mapping.get("prior_label", "") or "")
@@ -87,6 +92,8 @@ def compute_variance(
             "current_label": current_label,
             "prior_label": prior_label,
             "clearly_trivial": threshold,
+            "current_col": None,
+            "prior_col": None,
             "rows": [],
             "skipped": [],
             "error": "structure mapping missing valid current/prior column indices",
@@ -124,6 +131,7 @@ def compute_variance(
 
         rows.append({
             "label": label,
+            "row": r,
             "current": cur,
             "prior": prior,
             "abs_delta": abs_delta,
@@ -136,6 +144,8 @@ def compute_variance(
         "current_label": current_label,
         "prior_label": prior_label,
         "clearly_trivial": threshold,
+        "current_col": cc,
+        "prior_col": pc,
         "rows": rows,
         "skipped": skipped,
     }

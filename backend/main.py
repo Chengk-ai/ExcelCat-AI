@@ -807,20 +807,30 @@ class ReviewRequest(BaseModel):
     audit_enabled: Optional[bool] = True
 
 
-class VarianceRequest(BaseModel):
-    """Variance analysis: read-only, sourced from a statement worksheet (v1: IS).
-
-    The frontend chip reads the Income Statement tab's used range and posts it
-    here — distinct from the active-selection ChatRequest.context shape.
-    """
+class StatementIn(BaseModel):
+    """One statement worksheet inside a VarianceRequest."""
+    role: str  # "IS" | "BS" — validated in the endpoint
     values: List[List[Any]]
     # Accepted for forward-compatibility but NOT forwarded to the analysis
     # server — analyse_variance works on values only.
     formulas: List[List[Any]] = []
     address: str = ""
     sheet: str = ""
-    # Clearly-trivial materiality threshold (absolute, in the sheet's own units).
-    # Line items whose change is below it are split out as immaterial. 0 = no filter.
+
+
+class VarianceRequest(BaseModel):
+    """Variance analysis: read-only, sourced from statement worksheets.
+
+    The frontend chip reads whichever statement tabs exist (IS and/or BS) and
+    posts their used ranges here — distinct from the active-selection
+    ChatRequest.context shape. One statement → single-statement analysis;
+    IS + BS together → adds tie-out checks and the cross-statement ratio layer.
+    """
+    statements: List[StatementIn]
+    # Clearly-trivial materiality threshold (absolute, in the sheets' own
+    # units), shared across both statements; it doubles as the tie-out check
+    # tolerance. Line items whose change is below it are split out as
+    # immaterial. 0 = no filter.
     clearly_trivial: float = 0.0
     # Routing key into llm_client's MODEL_REGISTRY; None → DEFAULT_MODEL. Plain
     # str (validated in _call_model) so adding a model needs no schema change.
@@ -1354,25 +1364,29 @@ async def review_endpoint(request: ReviewRequest):
 @app.post("/variance")
 async def variance_endpoint(request: VarianceRequest):
     """
-    Year-over-year variance analysis over a financial statement (v1: Income
-    Statement). Read-only — never writes cells. The deterministic delta
-    computation and the two LLM passes run in the excelcat-analysis MCP server;
-    this endpoint owns request_id generation, loads the variance contract from
-    excelcat-skills, and keeps the audit chokepoint (the `variance_run` event).
+    Year-over-year variance analysis over one or two financial statements
+    (IS and/or BS). Read-only — never writes cells. The deterministic layer
+    (deltas, tie-out checks, cross-statement ratios) and the LLM passes run in
+    the excelcat-analysis MCP server; this endpoint owns request_id generation,
+    loads the variance contract from excelcat-skills, and keeps the audit
+    chokepoint (the `variance_run` event).
     """
     audit_enabled = bool(request.audit_enabled)
     request_id = str(uuid.uuid4())
     selected_model = request.model or DEFAULT_MODEL
 
     def _finish(result: dict, *, error=False) -> dict:
-        # Audit payload carries `address`, the materiality threshold that was
-        # applied, and which model ran the passes (routing key + real model_id),
-        # so the trail records what counted as trivial and who said so. The
-        # frontend response keeps the result shape. `error` is additive — only
-        # on a degraded path. (result may also echo clearly_trivial; it
-        # overrides and should match.)
+        # Audit payload carries the statement addresses, the materiality
+        # threshold that was applied, and which model ran the passes (routing
+        # key + real model_id), so the trail records what counted as trivial
+        # and who said so. The frontend response keeps the result shape.
+        # `error` is additive — only on a degraded path. (result may also echo
+        # clearly_trivial; it overrides and should match.)
         payload = {
-            "address": request.address,
+            "addresses": [
+                {"role": s.role, "sheet": s.sheet, "address": s.address}
+                for s in request.statements
+            ],
             "clearly_trivial": request.clearly_trivial,
             "model": selected_model,
             "model_id": resolve_model_id(selected_model),
@@ -1394,26 +1408,34 @@ async def variance_endpoint(request: VarianceRequest):
         # honest refusals (statement too large).
         return _finish(
             {
-                "current_label": "", "prior_label": "",
-                "variance_table": [], "skipped": [],
+                "statements": [], "checks": [], "ratios": [],
                 "anomalies": [], "cfo_questions": [], "summary": msg,
             },
             error=True,
         )
 
-    # Guard: Pass A puts the whole grid in front of the LLM, so a polluted used
+    valid_roles = {"IS", "BS"}
+    roles = [s.role for s in request.statements]
+    if not roles or any(r not in valid_roles for r in roles) or len(set(roles)) != len(roles):
+        return _error_result(
+            "Variance analysis expects one or two statements with distinct roles 'IS' and 'BS'."
+        )
+
+    # Guard: Pass A puts each whole grid in front of the LLM, so a polluted used
     # range (one stray cell at ZZ10000 balloons it to millions of cells) must be
     # refused here — before the token bill — with a message that says why. A
-    # real income statement sits far inside these bounds.
+    # real financial statement sits far inside these bounds. Checked per
+    # statement so the message can name the offending sheet.
     MAX_VARIANCE_ROWS, MAX_VARIANCE_COLS = 200, 30
-    n_rows = len(request.values)
-    n_cols = max((len(r) for r in request.values), default=0)
-    if n_rows > MAX_VARIANCE_ROWS or n_cols > MAX_VARIANCE_COLS:
-        return _error_result(
-            f"The sheet's used range is {n_rows} rows × {n_cols} columns — too large to "
-            f"analyse (limit {MAX_VARIANCE_ROWS} × {MAX_VARIANCE_COLS}). This usually means "
-            "stray cells outside the statement; clear them and try again."
-        )
+    for s in request.statements:
+        n_rows = len(s.values)
+        n_cols = max((len(r) for r in s.values), default=0)
+        if n_rows > MAX_VARIANCE_ROWS or n_cols > MAX_VARIANCE_COLS:
+            return _error_result(
+                f"The used range of '{s.sheet or s.role}' is {n_rows} rows × {n_cols} columns — "
+                f"too large to analyse (limit {MAX_VARIANCE_ROWS} × {MAX_VARIANCE_COLS}). This "
+                "usually means stray cells outside the statement; clear them and try again."
+            )
 
     session = getattr(app.state, "mcp_analysis", None)
     if session is None:
@@ -1431,11 +1453,17 @@ async def variance_endpoint(request: VarianceRequest):
         result = _unwrap_tool_result(await session.call_tool(
             "analyse_variance",
             {
-                "statement": {
-                    "values": request.values,
-                    "address": request.address,
-                    "sheet": request.sheet,
-                },
+                # formulas are deliberately not forwarded — the analysis works
+                # on values only (same policy as v1).
+                "statements": [
+                    {
+                        "role": s.role,
+                        "values": s.values,
+                        "address": s.address,
+                        "sheet": s.sheet,
+                    }
+                    for s in request.statements
+                ],
                 "contract_md": contract_md,
                 "model": selected_model,
                 "clearly_trivial": request.clearly_trivial or 0.0,
