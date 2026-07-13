@@ -23,15 +23,17 @@ _SKILLS_DIR = os.path.join(
 # Text skills: produce a written answer, no cell write.
 SKILL_FILE_MAP = {
     "summarise_data": "summarise.md",
-    "clean_data": "clean_data.md",
     "find_outliers": "find_outliers.md",
     "analyse_data": "analyse_data.md",
 }
 
 # Action skills: the skill file guides a structured action (a cell write) rather
 # than a text answer. Kept separate so they do NOT take the text-only return path.
+# clean_data moved here from the text map (contract v4): its proposals now go
+# through apply_cleaning → pre_write_hook → approval card instead of prose.
 ACTION_SKILL_FILE_MAP = {
     "forecast_data": "forecast.md",
+    "clean_data": "clean_data.md",
 }
 
 # Endpoint skills: served as a contract but NOT intent-routed via /chat. The
@@ -41,6 +43,7 @@ ACTION_SKILL_FILE_MAP = {
 # one file so the audit story holds.
 ENDPOINT_SKILL_FILE_MAP = {
     "variance_analysis": "variance_analysis.md",
+    "dcf": "dcf.md",
 }
 
 mcp = FastMCP("excelcat-skills")

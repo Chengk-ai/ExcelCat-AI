@@ -1,22 +1,23 @@
 # Skill: Variance Analysis
-version: 3
-last_updated: 2026-07-03
+version: 5
+last_updated: 2026-07-06
 
 ## Purpose
 Year-over-year variance analysis of financial statements — the Income Statement,
-the Balance Sheet, or both together. Compare each line item this year vs last
-year, then check whether related line items moved in directions that make
-business sense together. The goal is not just the numbers — it is to surface
-the questions a sharp analyst would take to the CFO.
+the Balance Sheet, the Cash Flow statement, or any combination. Compare each
+line item this year vs last year, then check whether related line items moved
+in directions that make business sense together. The goal is not just the
+numbers — it is to surface the questions a sharp analyst would take to the CFO.
 
 ## Important
 - The year-over-year figures (absolute change and %) are computed deterministically
   before you see them. **Treat the supplied variance tables as authoritative — never
   recompute or restate the numbers.** Your job is interpretation, not arithmetic.
-- **Tie-out checks and cross-statement ratios (DSO, DIO, DPO, implied interest rate)
-  are also computed deterministically before you see them.** Interpret the supplied
-  values; **never calculate a ratio yourself**, and never estimate a figure (such as
-  capex) that does not appear on the statements.
+- **Tie-out checks and cross-statement ratios (DSO, DIO, DPO, implied interest
+  rate, cash conversion, capex vs D&A) are also computed deterministically before
+  you see them.** Interpret the supplied values; **never calculate a ratio
+  yourself**, and never estimate a figure that does not appear on the supplied
+  statements.
 - A **clearly-trivial materiality threshold** is set by the user. Line items whose
   absolute change falls below it have already been filtered out before they reach
   you — they are immaterial, so do **not** mention them. Work only with the line
@@ -60,7 +61,25 @@ question — but **name the relationship explicitly** (which two items, and why 
 movements do not fit together), so a reviewer can audit exactly why you raised it.
 Never raise a vague concern without naming the two items behind it.
 
-## Relationship checks — cross-statement (when both statements are supplied)
+## Relationship checks — Cash Flow (when supplied)
+For each pair, decide whether the movements are consistent. Flag a divergence
+only when it is material.
+
+- **Net income vs operating cash flow** — profit growing while operating cash flow
+  stalls or falls means earnings are not turning into cash; question receivables
+  build-up, provisioning, or revenue recognition. The supplied cash-conversion
+  ratio is the evidence — cite it rather than reasoning loosely.
+- **Operating cash flow vs capex** — capital expenditure persistently above
+  operating cash flow means the business is not self-funding its investment; ask
+  how the gap is financed.
+- **Dividends paid vs operating cash flow** — dividends exceeding operating cash
+  flow are being paid out of borrowings or reserves rather than the year's cash
+  generation; question sustainability.
+- **Financing-inflow patterns** — large financing inflows (new debt or equity)
+  alongside weak operating cash flow suggest operations are being funded from
+  outside; ask what the proceeds are for and how long they last.
+
+## Relationship checks — cross-statement (when ratios are supplied)
 For each supplied ratio, decide whether its movement is consistent with the line
 items behind it. Flag a divergence only when it is material.
 
@@ -73,6 +92,15 @@ items behind it. Flag a divergence only when it is material.
 - **Implied interest rate vs Debt** — the implied rate jumping between years
   suggests refinancing at worse terms, or costs booked in interest that do not
   belong there.
+- **Cash conversion (operating cash flow ÷ net income)** — comfortably around or
+  above 1x is healthy; well below 1x and falling questions earnings quality. This
+  ratio keeps its sign: a negative value means the two have opposite signs — the
+  sharpest earnings-quality flag there is; say which side is negative.
+- **Capex vs D&A** — sustained well below 1x suggests the asset base is being run
+  down (under-investment); well above 1x flags an investment push whose expected
+  payoff is worth a question. Where a statement shows both a gross and a net
+  purchases line, capex is taken from the **net** line; the ratio's audit inputs
+  record the exact row used.
 
 As with the Income Statement pairs, this list is the minimum, not the universe —
 but every flag must name the figures behind it so a reviewer can audit exactly

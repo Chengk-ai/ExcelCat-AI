@@ -222,6 +222,17 @@ html, body {
   background: var(--accent-tint);
 }
 
+/* Discoverability hint under the helper chips (e.g. chat-only forecast). */
+.qa-hint {
+  width: 100%;
+  max-width: 280px;
+  margin: 6px auto 0;
+  font-size: 10.5px;
+  color: var(--text-muted);
+  line-height: 1.45;
+  text-align: left;
+}
+
 /* Audit tools render as list rows (not pills) so users read them as
    "run a report", not "fill the input". Icon + title + one-line desc + RUN. */
 .audit-tools {
@@ -649,6 +660,30 @@ html, body {
   color: var(--text);
   word-break: break-all;
 }
+/* Cleaning cards show old → new; the old value reads as "being replaced". */
+.batch-value.old {
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+/* Advisory notes on cleaning cards: findings reported but NOT actioned —
+   a compact list, clearly subordinate to the actionable diff above it. */
+.clean-notes {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  border-left: 3px solid var(--border);
+  padding: 4px 10px;
+}
+.clean-notes-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 3px;
+}
+.clean-notes ul { margin: 0; padding-left: 14px; }
+.clean-notes li { margin: 2px 0; }
 .verify-entry-decision.approved        { color: var(--accent2); background: rgba(34,197,94,0.13);  border: 1px solid rgba(34,197,94,0.25); }
 .verify-entry-decision.used-ai         { color: #5b9cf6;        background: rgba(91,156,246,0.15); border: 1px solid rgba(91,156,246,0.3); }
 .verify-entry-decision.rejected        { color: var(--text-muted); background: rgba(0,0,0,0.04); border: 1px solid var(--border); }
@@ -808,6 +843,7 @@ html, body {
 
 /* ── Input Area ── */
 #input-area {
+  position: relative;   /* anchor for the .jump-latest pill */
   flex-shrink: 0;
   padding: 12px 14px 14px;
   border-top: 1px solid var(--border);
@@ -1428,3 +1464,151 @@ html, body {
 
 /* Ratio basis line (e.g. "Receivables ÷ Revenue × 365") under each ratio label. */
 .vr-basis { font-size: 9.5px; color: var(--text-muted); font-weight: 400; }
+
+/* ── Persistent quick-action bar ──
+   Shown once a conversation exists (the empty-state launcher is gone by
+   then). Horizontal scroll, hidden scrollbar — the pane is narrow. */
+.qa-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.qa-bar::-webkit-scrollbar { display: none; }
+.qa-bar[hidden] { display: none; }
+.qa-bar-chip {
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.qa-bar-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent2);
+  background: var(--accent-tint);
+}
+.qa-bar-chip.audit {
+  color: var(--accent);
+  background: var(--accent-tint);
+  border-color: rgba(77, 75, 92, 0.2);
+}
+.qa-bar-sep {
+  flex-shrink: 0;
+  width: 1px;
+  height: 16px;
+  background: var(--border);
+}
+
+/* ── Send button stop mode ──
+   While a request is in flight the send button becomes a Stop button:
+   icon swaps and the fill shifts to the danger red used in the audit menu. */
+#send-btn .icon-stop { display: none; }
+#send-btn.busy { background: #b54a4a; }
+#send-btn.busy:hover { background: #9d3f3f; }
+#send-btn.busy .icon-send { display: none; }
+#send-btn.busy .icon-stop { display: block; }
+
+/* ── Typing status line (staged progress wording under the dots) ── */
+.typing-status {
+  margin-top: 7px;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+.typing-status:empty { display: none; }
+
+/* ── "New messages" jump pill ──
+   Floats just above the input area; shown when content arrives while the
+   user has scrolled up, instead of yanking their scroll position. */
+.jump-latest {
+  position: absolute;
+  top: -40px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  padding: 5px 12px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--accent2);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(40,38,55,0.16);
+}
+.jump-latest:hover { background: var(--surface2); }
+.jump-latest[hidden] { display: none; }
+
+/* ── Per-message selection-context tag ──
+   Records which data was in scope when a message was sent — the chat
+   transcript half of the audit story. */
+.msg-context {
+  display: inline-block;
+  margin-bottom: 4px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  border: 1px solid rgba(77, 75, 92, 0.2);
+  background: var(--accent-tint);
+  color: var(--accent2);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+/* ── Toasts (non-blocking feedback for otherwise-silent operations) ── */
+#toast-host {
+  position: fixed;
+  bottom: 92px;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  z-index: 100;
+  pointer-events: none;
+}
+.toast {
+  background: rgba(20, 20, 28, 0.95);
+  color: #f5f5f7;
+  font-size: 11.5px;
+  font-family: var(--font-sans);
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  max-width: 260px;
+  text-align: center;
+  animation: fadeIn 0.15s ease;
+  transition: opacity 0.35s;
+}
+.toast.out { opacity: 0; }
+
+/* ── Variance report: re-run button + row-click hint ── */
+.review-report-rerun {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-family: var(--font-sans);
+  color: var(--accent);
+  background: var(--accent-tint);
+  border: 1px solid rgba(77, 75, 92, 0.2);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.review-report-rerun:hover { background: rgba(77, 75, 92, 0.15); }
+.variance-hint {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  padding: 2px 2px 0;
+}

@@ -16,6 +16,13 @@ deterministically, against evidence already in hand:
   3. method guardrail — forecast.md forbids exponential methods on histories
      containing zero/negative values (GROWTH/CAGR error or mislead there).
      The contract states it; this rule enforces it.
+  4. chain / pattern consistency — reflexion only LLM-checks the batch's
+     FIRST formula; the remaining cells are validated structurally instead.
+     The contract's examples take exactly two forms: a growth chain (each
+     cell compounds off its predecessor) or one shared pattern
+     (FORECAST.LINEAR / GROWTH / CAGR, varying only in the target column's
+     period ref). A batch that fits neither form has a mis-linked cell
+     somewhere reflexion never looked.
 
 Proof-of-work: when a check runs clean it emits an `info` result, so the
 audit trail distinguishes "checked, fine" from "couldn't check" — the same
@@ -69,6 +76,55 @@ def _contains_run(seq: list, run: list) -> bool:
         if all(_close(seq[i + j], run[j]) for j in range(m)):
             return True
     return False
+
+
+# A1-style refs with their $ markers preserved for template rebuilding.
+_REF_PARTS_RE = re.compile(r"(\$?)([A-Za-z]+)(\$?)([0-9]+)")
+
+
+def _formula_refs(formula: str) -> set:
+    """All A1-style refs in a formula, normalised (no $, upper-case)."""
+    return {f"{m.group(2).upper()}{m.group(4)}" for m in _REF_PARTS_RE.finditer(formula or "")}
+
+
+def _norm_cell(cell: str) -> str:
+    return (cell or "").replace("$", "").strip().upper()
+
+
+def _cell_col(cell_norm: str) -> str:
+    m = re.match(r"([A-Z]+)", cell_norm)
+    return m.group(1) if m else ""
+
+
+def _col_template(formula: str, col: str) -> str:
+    """Abstract every ref in the target cell's own column to {c}, then
+    normalise (upper-case, no whitespace) — the column-wise analogue of
+    main.py's _row_template. Pattern-method formulas vary only in their own
+    column's period ref, so a healthy batch reduces to ONE such template."""
+    def sub(m):
+        d1, letters, d2, row = m.groups()
+        body = "{c}" if letters.upper() == col else letters.upper()
+        return f"{d1}{body}{d2}{row}"
+    return re.sub(r"\s+", "", _REF_PARTS_RE.sub(sub, formula or "")).upper()
+
+
+def _is_chain(cells_norm: list, formulas: list) -> bool:
+    """True when the batch links like the contract's growth chains: the first
+    formula references only cells OUTSIDE the batch (the last actual), and
+    every later formula references its predecessor and nothing at-or-after
+    itself (no self/forward references)."""
+    target_set = set(cells_norm)
+    for k, f in enumerate(formulas):
+        refs = _formula_refs(f)
+        if k == 0:
+            if refs & target_set:
+                return False
+        else:
+            if cells_norm[k - 1] not in refs:
+                return False
+            if refs & set(cells_norm[k:]):
+                return False
+    return True
 
 
 class ForecastIntegrityRule(Rule):
@@ -148,5 +204,43 @@ class ForecastIntegrityRule(Rule):
                     "explicit growth rate here."
                 ),
             ))
+
+        # ── 4. Chain / pattern consistency (the cells reflexion never sees) ──
+        # Pass when the batch is EITHER one shared column-template (pattern
+        # methods) OR a well-linked chain (growth methods). Both checks are
+        # purely structural — no LLM calls.
+        cells = [c for c in (args.get("cells") or []) if isinstance(c, str)]
+        formulas = args.get("values") or []
+        if (
+            len(cells) >= 2
+            and len(cells) == len(formulas)
+            and all(isinstance(f, str) and f.strip().startswith("=") for f in formulas)
+        ):
+            cells_norm = [_norm_cell(c) for c in cells]
+            tlist = [_col_template(f, _cell_col(cn)) for f, cn in zip(formulas, cells_norm)]
+            if len(set(tlist)) == 1 or _is_chain(cells_norm, formulas):
+                results.append(RuleResult("forecast_chain_verified", "info", ""))
+            else:
+                # Point at the cells deviating from the majority template —
+                # heuristic, but it gives the reviewer somewhere to look.
+                counts: dict = {}
+                for t in tlist:
+                    counts[t] = counts.get(t, 0) + 1
+                majority = max(counts, key=counts.get)
+                offenders = [c for c, t in zip(cells, tlist) if t != majority][:3]
+                where = f" Start with {', '.join(offenders)}." if offenders else ""
+                results.append(RuleResult(
+                    rule_id="forecast_chain_broken",
+                    level="warning",
+                    message=(
+                        "The forecast formulas are neither a consistent chain (each "
+                        "cell compounding off the previous one) nor one shared "
+                        "pattern — at least one cell links differently from the "
+                        "rest. Reflexion only checks the first formula, so please "
+                        f"review the later cells' references before approving.{where}"
+                    ),
+                ))
+        else:
+            results.append(RuleResult("forecast_chain_unchecked", "info", ""))
 
         return results

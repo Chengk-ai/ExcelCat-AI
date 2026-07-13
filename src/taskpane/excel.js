@@ -29,6 +29,16 @@ export async function refreshSelection() {
   }
 }
 
+// Compact label of the selection currently held as context, e.g.
+// "Sheet1!A1:B10 · 12×2". Stamped onto each sent message so the transcript
+// records which data shaped that turn — the chat half of the audit story.
+// Null when no selection context is held.
+export function selectionContextLabel() {
+  const c = state.selectionContext;
+  if (!c) return null;
+  return `${c.sheet}!${c.address} · ${c.rowCount}×${c.columnCount}`;
+}
+
 // Write the Chart Function
 export async function createNativeChart(chartType, title = 'AI Generated Chart') {
   // Throws on failure — caller (approve handler) shows the resolution.
@@ -97,6 +107,72 @@ export const BS_SHEET_NAMES = [
   'BS', 'Balance Sheet', 'Balance sheet', 'balance sheet',
   'SOFP', 'Statement of Financial Position', 'Statement of financial position',
 ];
+
+export const CF_SHEET_NAMES = [
+  'CF', 'Cash Flow', 'Cash flow', 'cash flow',
+  'Cash Flow Statement', 'Statement of Cash Flows', 'Cashflow', 'SCF',
+];
+
+// True if a worksheet with this exact name exists (even when empty —
+// readSheetByName can't answer that, because it returns null for an existing
+// sheet whose used range is empty). Used for collision checks before a
+// template write creates new sheets.
+export async function sheetExists(name) {
+  return (await anySheetExists([name])) !== null;
+}
+
+// First existing sheet name from `names`, or null — ONE Excel.run for the
+// whole list (probing N sheets one call at a time pays N round-trips).
+export async function anySheetExists(names) {
+  let found = null;
+  try {
+    await Excel.run(async ctx => {
+      const probes = names.map(n => {
+        const ws = ctx.workbook.worksheets.getItemOrNullObject(n);
+        ws.load(['name', 'isNullObject']);
+        return ws;
+      });
+      await ctx.sync();
+      const hit = probes.find(p => !p.isNullObject);
+      if (hit) found = hit.name;
+    });
+  } catch {
+    // Demo / no Office — treat as absent.
+  }
+  return found;
+}
+
+// Write a batch of cells onto a NAMED sheet, creating the sheet if it does not
+// exist. One Excel.run for the whole batch. "=" strings go through
+// range.formulas (so Excel parses them as formulas); everything else through
+// range.values, with numeric strings coerced so assumptions land as numbers,
+// not text. Unlike writeToCellTool this never touches the ACTIVE sheet — a
+// template write must land on its own tab regardless of what the user has
+// open. Throws on failure — caller shows the resolution.
+export async function writeCellsToSheet(sheetName, cells, values, { activate = false } = {}) {
+  await Excel.run(async ctx => {
+    const sheets = ctx.workbook.worksheets;
+    let sheet = sheets.getItemOrNullObject(sheetName);
+    sheet.load(['isNullObject']);
+    await ctx.sync();
+    if (sheet.isNullObject) {
+      sheet = sheets.add(sheetName);
+    }
+    for (let k = 0; k < cells.length; k++) {
+      const range = sheet.getRange(cells[k]);
+      const v = values[k];
+      if (typeof v === 'string' && v.startsWith('=')) {
+        range.formulas = [[v]];
+      } else if (typeof v === 'string' && v.trim() !== '' && isFinite(Number(v))) {
+        range.values = [[Number(v)]];
+      } else {
+        range.values = [[v]];
+      }
+    }
+    if (activate) sheet.activate();
+    await ctx.sync();
+  });
+}
 
 // Activate a sheet and select a range (e.g. "C5:E5"). Used by the variance
 // report's click-to-highlight: clicking a table row selects the source cells

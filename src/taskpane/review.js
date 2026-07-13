@@ -1,24 +1,38 @@
 // Review chip flow: selection → /review → assumption-review report card.
 
-import { state, API_BASE, messagesEl, emptyState, sendBtn, escapeHtml } from './core';
-import { addMessage, showTyping, hideTyping } from './messages';
+import { state, API_BASE, messagesEl, escapeHtml, setSendBusy, showToast } from './core';
+import { addMessage, showTyping, hideTyping, hideEmptyState, scrollMessages } from './messages';
+
+// Review is deterministic (no LLM) so it's normally quick; the later
+// stages only ever show when the backend is struggling.
+const REVIEW_STAGES = [
+  [0,  'Locating model inputs…'],
+  [6,  'Checking inputs against sensible ranges…'],
+  [20, 'Still working…'],
+];
 
 // ── Review Layer (on-demand assumption checks) ────────
 export async function triggerReview() {
   if (!state.selectionContext) {
-    addMessage('assistant', 'Please select a range first, then click Review Assumptions.');
+    // Pre-condition nag — a toast, not a chat message: it shouldn't enter
+    // the history (or kill the empty-state launcher).
+    showToast('Select the range that holds your model first, then run Review again.');
+    return;
+  }
+  if (state.isTyping) {
+    showToast('Hold on — another request is still running.');
     return;
   }
 
-  // Show typing while we fetch.
-  state.isTyping = true;
-  sendBtn.disabled = true;
-  showTyping();
+  setSendBusy(true);
+  showTyping(REVIEW_STAGES);
 
   // 45s timeout — review is deterministic (no LLM), so anything this slow
   // means the backend is wedged; surface an error rather than leaving the
   // typing indicator spinning forever.
   const controller = new AbortController();
+  state.activeController = controller;
+  state.stopRequested = false;
   const timer = setTimeout(() => controller.abort(), 45_000);
 
   try {
@@ -33,25 +47,28 @@ export async function triggerReview() {
       }),
       signal: controller.signal,
     });
-    clearTimeout(timer);
-
-    state.isTyping = false;
-    sendBtn.disabled = false;
-    hideTyping();
 
     if (!resp.ok) throw new Error(`Server error: ${resp.status}`);
 
     const data = await resp.json();
+    hideTyping();
     renderReviewReport(data);
   } catch (err) {
-    clearTimeout(timer);
-    state.isTyping = false;
-    sendBtn.disabled = false;
     hideTyping();
-    const msg = err.name === 'AbortError'
-      ? '⚠️ Review timed out (45s). The backend may be unresponsive — check it is running and try again.'
-      : `⚠️ Review failed: ${err.message}`;
+    let msg;
+    if (err.name === 'AbortError' && state.stopRequested) {
+      msg = '⏹️ Stopped — the review was cancelled.';
+    } else if (err.name === 'AbortError') {
+      msg = "⚠️ Review timed out after 45 seconds — the backend looks unresponsive. Check it's running, then run Review again.";
+    } else {
+      msg = `⚠️ Review failed: ${err.message}`;
+    }
     addMessage('assistant', msg);
+  } finally {
+    clearTimeout(timer);
+    state.activeController = null;
+    setSendBusy(false);
+    hideTyping();
   }
 }
 
@@ -60,10 +77,8 @@ function renderReviewReport(data) {
   const located = data.located || {};
   const summary = data.summary || '';
 
-  // Remove empty state if still showing.
-  if (messagesEl.contains(emptyState)) {
-    messagesEl.removeChild(emptyState);
-  }
+  // Remove empty state if still showing (also reveals the qa-bar).
+  hideEmptyState();
 
   const locatedEntries = Object.entries(located);
   const inspectedCells = data.inspected_cells || {};
@@ -142,5 +157,5 @@ function renderReviewReport(data) {
     </div>
   `;
   messagesEl.appendChild(wrap);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  scrollMessages();
 }

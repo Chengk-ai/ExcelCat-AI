@@ -85,9 +85,11 @@ def _get_gemini_client() -> genai.Client:
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not configured in backend/.env")
-        # 30s per call (HttpOptions.timeout is in MILLISECONDS). Without this
-        # the SDK waits indefinitely — a hung Gemini call was the "spinner
-        # never stops" failure mode on /review and /variance.
+        # 30s default per call (HttpOptions.timeout is in MILLISECONDS); callers
+        # override it per request via GenerateContentConfig.http_options in
+        # _call_model. Without a cap the SDK waits indefinitely — a hung Gemini
+        # call was the "spinner never stops" failure mode on /review and
+        # /variance.
         _gemini_client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(timeout=30_000),
@@ -284,13 +286,233 @@ FORECAST_ONLY_TOOLS = {
 }
 
 
+# ── Cleaning structured action (exposed only on the contracted second pass) ──
+# Same pattern as apply_forecast: the model only sees this after clean_data.md
+# (v4, action contract) is in the prompt. The four aligned arrays ARE the audit
+# record: old_values gets verified against the sheet and new_values against the
+# declared fix_type, both deterministically (rules/clean_integrity.py) — there
+# is no LLM anywhere in the verification path for cleaning.
+_APPLY_CLEANING_OPENAI = {
+    "type": "function",
+    "function": {
+        "name": "apply_cleaning",
+        "description": (
+            "Emit the complete set of mechanical cleaning fixes as ONE call: "
+            "target cells, the exact current value of each, the cleaned value, "
+            "and the fix type applied — plus notes for advisory-only findings."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cells": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Target cell addresses, e.g. ['A3','D7']",
+                },
+                "old_values": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Current content of each cell, copied EXACTLY from the "
+                        "data context, aligned with 'cells'"
+                    ),
+                },
+                "new_values": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Cleaned value for each cell — must be exactly the "
+                        "declared fix_type applied to the old value"
+                    ),
+                },
+                "fix_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["trim", "case_title", "case_upper", "case_lower"],
+                    },
+                    "description": "The mechanical fix applied to each cell, aligned with 'cells'",
+                },
+                "notes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Advisory findings NOT actioned (blank cells, duplicate "
+                        "rows, date formats, currency symbols) — one CONCRETE "
+                        "plain-English finding per item: name the cells, quote "
+                        "the offending value, state the problem. No markdown."
+                    ),
+                },
+            },
+            "required": ["cells", "old_values", "new_values", "fix_types"],
+        },
+    },
+}
+
+CLEAN_ONLY_TOOLS = {
+    "openai": [_APPLY_CLEANING_OPENAI],
+    "gemini": _to_gemini_tool([_APPLY_CLEANING_OPENAI]),
+}
+
+
+# ── DCF structured action (exposed only on the contracted /dcf pass) ──
+# Same declared-vs-actual pattern as apply_cleaning: the scalar/array metadata
+# is the model's declaration, and deterministic rules (dcf_sanity, dcf_integrity)
+# verify the emitted sheets embody it. Chip-only — never advertised on the /chat
+# intent pass, so this tool does not join OPENAI_TOOLS.
+_DRIVER_ARRAY = {"type": "array", "items": {"type": "number"}}
+
+_APPLY_DCF_TEMPLATE_OPENAI = {
+    "type": "function",
+    "function": {
+        "name": "apply_dcf_template",
+        "description": (
+            "Emit the complete two-sheet DCF valuation as ONE call: every cell "
+            "of the fixed WACC and DCF templates, plus the declared assumptions, "
+            "drivers, historical series and per-assumption rationale."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sheets": {
+                    "type": "array",
+                    "description": "Exactly two entries: the WACC sheet then the DCF sheet",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "'WACC' or 'DCF'"},
+                            "cells": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Cell addresses, e.g. ['A1','B3']",
+                            },
+                            "values": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Aligned with 'cells': labels, plain numbers "
+                                    "(assumptions/historicals) or '=' formulas"
+                                ),
+                            },
+                        },
+                        "required": ["name", "cells", "values"],
+                    },
+                },
+                "wacc_components": {
+                    "type": "object",
+                    "description": "The CAPM inputs as declared on the WACC sheet (decimals)",
+                    "properties": {
+                        "rf": {"type": "number"},
+                        "beta": {"type": "number"},
+                        "mrp": {"type": "number"},
+                        "cost_of_debt": {"type": "number"},
+                        "tax_rate": {"type": "number"},
+                        "debt": {"type": "number"},
+                        "equity": {"type": "number"},
+                    },
+                    "required": ["rf", "beta", "mrp", "cost_of_debt", "tax_rate", "debt", "equity"],
+                },
+                "wacc": {"type": "number", "description": "The resulting WACC as a decimal"},
+                "terminal_growth": {"type": "number", "description": "TGR as a decimal"},
+                "drivers": {
+                    "type": "object",
+                    "description": "Per-forecast-year driver assumptions, one value per year",
+                    "properties": {
+                        "revenue_growth": _DRIVER_ARRAY,
+                        "ebit_margin": _DRIVER_ARRAY,
+                        "tax_pct_ebit": _DRIVER_ARRAY,
+                        "dna_pct_sales": _DRIVER_ARRAY,
+                        "capex_pct_sales": _DRIVER_ARRAY,
+                        "dnwc_pct_sales": _DRIVER_ARRAY,
+                    },
+                    "required": ["revenue_growth", "ebit_margin", "tax_pct_ebit",
+                                 "dna_pct_sales", "capex_pct_sales", "dnwc_pct_sales"],
+                },
+                "forecast_years": {"type": "integer"},
+                "historical": {
+                    "type": "object",
+                    "description": (
+                        "The derived historical series exactly as supplied "
+                        "(echoed for the deterministic provenance check)"
+                    ),
+                    "properties": {
+                        "revenue": _DRIVER_ARRAY,
+                        "ebit": _DRIVER_ARRAY,
+                        "taxes": _DRIVER_ARRAY,
+                        "dna": _DRIVER_ARRAY,
+                        "capex": _DRIVER_ARRAY,
+                        "dnwc": _DRIVER_ARRAY,
+                        "cash": {"type": "number"},
+                        "debt": {"type": "number"},
+                    },
+                    "required": ["revenue", "ebit"],
+                },
+                "shares": {"type": "number", "description": "Shares outstanding, if supplied"},
+                "current_price": {"type": "number", "description": "Current share price, if supplied"},
+                # The WACC/TGR cell addresses are NOT declared here — the
+                # template pins them (dcf.md → WACC!B16, DCF!B4) and the
+                # integrity rule holds them as constants; a second declaration
+                # would only drift. driver_rows stays declared because the
+                # driver rows hold per-run values the rule must find.
+                "assumption_cells": {
+                    "type": "object",
+                    "description": "Where the per-year driver assumptions live",
+                    "properties": {
+                        "driver_rows": {
+                            "type": "object",
+                            "description": "Driver name → DCF-sheet row number (per the fixed template)",
+                            "properties": {
+                                "revenue_growth": {"type": "integer"},
+                                "ebit_margin": {"type": "integer"},
+                                "tax_pct_ebit": {"type": "integer"},
+                                "dna_pct_sales": {"type": "integer"},
+                                "capex_pct_sales": {"type": "integer"},
+                                "dnwc_pct_sales": {"type": "integer"},
+                            },
+                        },
+                    },
+                    "required": ["driver_rows"],
+                },
+                "rationale": {
+                    "type": "object",
+                    "description": "One sentence per headline assumption",
+                    "properties": {
+                        "wacc": {"type": "string"},
+                        "terminal_growth": {"type": "string"},
+                        "revenue_growth": {"type": "string"},
+                        "ebit_margin": {"type": "string"},
+                        "tax_pct_ebit": {"type": "string"},
+                        "dna_pct_sales": {"type": "string"},
+                        "capex_pct_sales": {"type": "string"},
+                        "dnwc_pct_sales": {"type": "string"},
+                    },
+                    "required": ["wacc", "terminal_growth"],
+                },
+            },
+            "required": ["sheets", "wacc_components", "wacc", "terminal_growth",
+                         "drivers", "forecast_years", "historical",
+                         "assumption_cells", "rationale"],
+        },
+    },
+}
+
+DCF_ONLY_TOOLS = {
+    "openai": [_APPLY_DCF_TEMPLATE_OPENAI],
+    "gemini": _to_gemini_tool([_APPLY_DCF_TEMPLATE_OPENAI]),
+}
+
+
 # ── Transport ─────────────────────────────────────────────
 # One shared client so every OpenAI-compat call reuses pooled connections
 # instead of paying a fresh TCP+TLS handshake — a single /chat round with
 # reflexion can make several calls. Lives for the process lifetime; no explicit
-# close. 30s per call: the frontend gives /chat 90s in total, so one slow call
-# must not be allowed to eat two-thirds of that budget.
-_http_client = httpx.AsyncClient(timeout=30)
+# close. The 30s default per call is sized for /chat's 90s frontend budget —
+# one slow call must not eat two-thirds of it. Callers with a bigger budget
+# (variance: 150s in variance.js, whole-sheet prompts) pass timeout_s instead
+# of inheriting the chat constraint.
+DEFAULT_TIMEOUT_S = 30
+
+_http_client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S)
 
 
 async def _call_openai_compat(
@@ -299,6 +521,7 @@ async def _call_openai_compat(
     system_instruction: Optional[str] = None,
     use_tools: bool = False,
     tools_override: Optional[list] = None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> dict:
     """Transport for any OpenAI-style /chat/completions vendor (DeepSeek, OpenAI…).
 
@@ -332,12 +555,30 @@ async def _call_openai_compat(
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {api_key}",
             },
+            timeout=timeout_s,
         )
         resp.raise_for_status()
         data = resp.json()
+    except httpx.TimeoutException as e:
+        # str(ReadTimeout()) is EMPTY — without this the user sees a blank
+        # "Backend error:". Say what happened and what to do about it.
+        raise RuntimeError(
+            f"{entry['label']} took longer than {timeout_s:g}s on a single call — "
+            f"the provider is slow right now. Try again, or switch model."
+        ) from e
     except httpx.HTTPStatusError as e:
         body = e.response.text
         raise RuntimeError(f"{entry['label']} API error {e.response.status_code}: {body}") from e
+    except httpx.HTTPError as e:
+        # Connection-level failures can also stringify poorly; repr never does.
+        raise RuntimeError(f"{entry['label']} connection error: {e!r}") from e
+    except json.JSONDecodeError as e:
+        # A 200 with an empty/non-JSON body — typically a gateway timing out
+        # upstream. Raw, this surfaces as "Expecting value: line 1 column 1".
+        raise RuntimeError(
+            f"{entry['label']} returned an empty or malformed response — usually "
+            f"a provider-side timeout. Try again, or switch model."
+        ) from e
 
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -365,6 +606,7 @@ async def _call_model(
     system_instruction: Optional[str] = None,
     use_tools: bool = False,
     tools_override: Optional[dict] = None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> dict:
     # tools_override (when given) restricts which tools the model may call this
     # call. Shape: {"openai": [...openai tool dicts...], "gemini": types.Tool}.
@@ -386,19 +628,21 @@ async def _call_model(
             system_instruction=system_instruction,
             use_tools=use_tools,
             tools_override=(tools_override or {}).get("openai"),
+            timeout_s=timeout_s,
         )
 
     # Gemini SDK is synchronous — run in a thread so it doesn't block the
     # event loop either. Same principle as the DeepSeek fix.
-    config = None
-    if system_instruction or use_tools:
-        gemini_tools = None
-        if use_tools:
-            gemini_tools = [(tools_override or {}).get("gemini") or tools]
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction if system_instruction else None,
-            tools=gemini_tools,
-        )
+    gemini_tools = None
+    if use_tools:
+        gemini_tools = [(tools_override or {}).get("gemini") or tools]
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction if system_instruction else None,
+        tools=gemini_tools,
+        # Per-request override of the client-level default; HttpOptions.timeout
+        # is in MILLISECONDS.
+        http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),
+    )
 
     def _gemini_sync():
         return _get_gemini_client().models.generate_content(
@@ -407,7 +651,21 @@ async def _call_model(
             config=config,
         )
 
-    response = await asyncio.to_thread(_gemini_sync)
+    try:
+        response = await asyncio.to_thread(_gemini_sync)
+    except httpx.TimeoutException as e:
+        raise RuntimeError(
+            f"{entry['label']} took longer than {timeout_s:g}s on a single call — "
+            f"the provider is slow right now. Try again, or switch model."
+        ) from e
+    except json.JSONDecodeError as e:
+        # The SDK parses the HTTP body as JSON; an empty/truncated body (a
+        # gateway timing out upstream) escapes as a raw
+        # "Expecting value: line 1 column 1" otherwise.
+        raise RuntimeError(
+            f"{entry['label']} returned an empty or malformed response — usually "
+            f"a provider-side timeout. Try again, or switch model."
+        ) from e
 
     parsed_tool_calls = []
     text = ""

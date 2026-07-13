@@ -26,7 +26,10 @@ from profile_stats import build_profile
 # _call_model for the /chat passes, FORECAST_ONLY_TOOLS for the forecast pass,
 # and DEFAULT_MODEL / resolve_model_id so routing and the audit trail agree on
 # which model actually ran.
-from llm_client import _call_model, FORECAST_ONLY_TOOLS, DEFAULT_MODEL, resolve_model_id
+from llm_client import (
+    _call_model, FORECAST_ONLY_TOOLS, CLEAN_ONLY_TOOLS, DCF_ONLY_TOOLS,
+    DEFAULT_MODEL, resolve_model_id,
+)
 
 # ── MCP servers ───────────────────────────────────────────
 # The MCP refactor splits backend-owned logic into stdio MCP servers, spawned
@@ -451,6 +454,40 @@ async def pre_write_hook(
                     "reason": _first_critique(review_meta["log"]),
                 })
 
+    # ── DCF batch: one structured action carrying two whole sheets. Run
+    # reflexion once on the terminal-value formula — the single highest-stakes
+    # formula in the template (a wrong Gordon TV silently mis-values the whole
+    # company). Informational only (batch card has no "Use AI's version"); the
+    # structural wiring and numeric bands come from the deterministic rules
+    # below. This also finally populates "Check 3: Financial logic" — via
+    # check_rules, keeping the rules in the MCP server.
+    if tool_call["name"] == "apply_dcf_template":
+        tv_formula = _dcf_tv_formula(tool_call.get("args", {}))
+        if tv_formula:
+            checks_run.append("formula_correctness")
+            # No formula in the log line — new debug lines must not print user data.
+            print("[HOOK] Running DCF terminal-value check")
+            review_meta = await reflexion_review(
+                tv_formula,
+                enriched_context,
+                selected_model=selected_model,
+                request_id=request_id,
+                audit_enabled=audit_enabled,
+            )
+            ai_version = _extract_formula(review_meta["final_reply"])
+            if not review_meta["verified"]:
+                warnings.append(
+                    f"Terminal-value formula did not pass verification after "
+                    f"{review_meta['iterations']} attempts — please review manually."
+                )
+            elif ai_version and _normalise_formula(ai_version) != _normalise_formula(tv_formula):
+                suggestions.append({
+                    "field": "value",
+                    "original": tv_formula,
+                    "suggested": ai_version,
+                    "reason": _first_critique(review_meta["log"]),
+                })
+
     # ── Check 2: Data Integrity (deterministic rules, via excelcat-verify MCP) ──
     # The rules run in the MCP server (single source of truth). This sits on the
     # audit chokepoint, so we fail loud, never silent: if the server is down we
@@ -511,6 +548,23 @@ async def pre_write_hook(
         "checks_run": checks_run,
         "review_meta": review_meta,
     }
+
+
+def _dcf_tv_formula(args: dict) -> str:
+    """The terminal-value formula from an apply_dcf_template call's DCF sheet
+    (template row 24), or "" when absent/malformed. Row-addressed, not
+    pattern-matched, so the hook samples the same cell the integrity rule
+    verifies."""
+    for sheet in args.get("sheets") or []:
+        if str(sheet.get("name", "")).strip().upper() != "DCF":
+            continue
+        cells = sheet.get("cells") or []
+        values = sheet.get("values") or []
+        for c, v in zip(cells, values):
+            parsed = _parse_cell(str(c).replace("$", ""))
+            if parsed and parsed[1] == 24 and str(v).startswith("="):
+                return str(v)
+    return ""
 
 
 def _hook_status(warnings: list, suggestions: list) -> str:
@@ -809,7 +863,7 @@ class ReviewRequest(BaseModel):
 
 class StatementIn(BaseModel):
     """One statement worksheet inside a VarianceRequest."""
-    role: str  # "IS" | "BS" — validated in the endpoint
+    role: str  # "IS" | "BS" | "CF" — validated in the endpoint
     values: List[List[Any]]
     # Accepted for forward-compatibility but NOT forwarded to the analysis
     # server — analyse_variance works on values only.
@@ -821,14 +875,14 @@ class StatementIn(BaseModel):
 class VarianceRequest(BaseModel):
     """Variance analysis: read-only, sourced from statement worksheets.
 
-    The frontend chip reads whichever statement tabs exist (IS and/or BS) and
-    posts their used ranges here — distinct from the active-selection
-    ChatRequest.context shape. One statement → single-statement analysis;
-    IS + BS together → adds tie-out checks and the cross-statement ratio layer.
+    The frontend chip reads whichever statement tabs exist (any subset of
+    IS/BS/CF) and posts their used ranges here — distinct from the
+    active-selection ChatRequest.context shape. Each additional statement
+    unlocks the tie-out checks and cross-statement ratios that need it.
     """
     statements: List[StatementIn]
     # Clearly-trivial materiality threshold (absolute, in the sheets' own
-    # units), shared across both statements; it doubles as the tie-out check
+    # units), shared across all statements; it doubles as the tie-out check
     # tolerance. Line items whose change is below it are split out as
     # immaterial. 0 = no filter.
     clearly_trivial: float = 0.0
@@ -836,6 +890,60 @@ class VarianceRequest(BaseModel):
     # str (validated in _call_model) so adding a model needs no schema change.
     model: Optional[str] = None
     audit_enabled: Optional[bool] = True
+
+class DcfRequest(BaseModel):
+    """DCF valuation: multi-tab historical read → driver derivation → one
+    contracted apply_dcf_template proposal through the pre-write hook.
+
+    IS and CF are hard requirements (each needs ≥3 historical years — enforced
+    after derivation, when the year count is known); BS is optional. shares /
+    current_price / cash & debt overrides come from the setup card — market
+    data the statements can't supply.
+    """
+    statements: List[StatementIn]
+    forecast_years: int = 5
+    shares: Optional[float] = None
+    current_price: Optional[float] = None
+    cash_override: Optional[float] = None
+    debt_override: Optional[float] = None
+    # Reject-&-retry note from the approval card — user feedback for the
+    # assumptions pass ("use a 2% TGR", "beta is too high"), audited via dcf_run.
+    user_note: Optional[str] = None
+    model: Optional[str] = None
+    audit_enabled: Optional[bool] = True
+
+
+# ── Action-skill second passes ────────────────────────────
+# Per action skill: which restricted tool set the contracted second pass may
+# call, the closing instruction appended after the contract, and whether the
+# deterministic data profile is injected (clean's contract references its
+# blank/duplicate counts; forecast doesn't need it). Keyed by intent tool name
+# — must match skills_server's ACTION_SKILL_FILE_MAP.
+ACTION_SKILL_PASS = {
+    "forecast_data": {
+        "tools": FORECAST_ONLY_TOOLS,
+        "profile": False,
+        "closing": (
+            "\n\nNow call apply_forecast exactly once: provide the target cells, "
+            "the formula for each cell (aligned with the cells), the method, a "
+            "one-sentence rationale, and the historical values you based the "
+            "forecast on."
+        ),
+    },
+    "clean_data": {
+        "tools": CLEAN_ONLY_TOOLS,
+        "profile": True,
+        "closing": (
+            "\n\nNow call apply_cleaning exactly once: provide the target cells, "
+            "each cell's current value copied exactly, the cleaned value, and the "
+            "fix type for each (four aligned arrays), plus notes — a LIST with one "
+            "CONCRETE plain-English finding per item (name the cells, quote the "
+            "offending value, state the problem), no markdown — for anything "
+            "advisory. If nothing is actionable, make no tool call and reply "
+            "\"No actionable issues found.\" followed by the findings."
+        ),
+    },
+}
 
 # ── Main endpoint ─────────────────────────────────────────
 @app.post("/chat")
@@ -1040,40 +1148,48 @@ async def chat_endpoint(request: ChatRequest):
                 "request_id": request_id,
             }
 
-        # 5b. Handle action-skill tools (forecast_data). Two-pass like skills,
-        # but the second pass produces a structured action (apply_forecast)
-        # under the loaded contract, then falls through to the action path so
-        # it goes through pre_write_hook and is shown as one approval card.
-        forecast_intent = next((t for t in tool_calls if t["name"] in app.state.skill_action_names), None)
-        if forecast_intent:
+        # 5b. Handle action-skill tools (forecast_data, clean_data). Two-pass
+        # like text skills, but the second pass produces a structured action
+        # (apply_forecast / apply_cleaning) under the loaded contract, then
+        # falls through to the action path so it goes through pre_write_hook
+        # and is shown as one approval card. A second pass that makes NO tool
+        # call (e.g. "no actionable issues") falls through to the plain-text
+        # reply path naturally.
+        action_intent = next((t for t in tool_calls if t["name"] in app.state.skill_action_names), None)
+        if action_intent and action_intent["name"] in ACTION_SKILL_PASS:
+            pass_cfg = ACTION_SKILL_PASS[action_intent["name"]]
             try:
-                skill_content = await _load_skill_content(forecast_intent["name"])
+                skill_content = await _load_skill_content(action_intent["name"])
             except RuntimeError:
                 return _skills_unavailable_response(request_id, audit_enabled)
-            print(f"[DEBUG] Action-skill triggered: {forecast_intent['name']}, file loaded: {skill_content is not None}")
+            print(f"[DEBUG] Action-skill triggered: {action_intent['name']}, file loaded: {skill_content is not None}")
 
-            forecast_prompt = base_prompt
+            action_prompt = base_prompt
             if skill_content:
-                forecast_prompt += f"\n\n── SKILL INSTRUCTIONS (follow these precisely) ──\n{skill_content}"
-            forecast_prompt += (
-                "\n\nNow call apply_forecast exactly once: provide the target cells, "
-                "the formula for each cell (aligned with the cells), the method, a "
-                "one-sentence rationale, and the historical values you based the "
-                "forecast on."
-            )
+                action_prompt += f"\n\n── SKILL INSTRUCTIONS (follow these precisely) ──\n{skill_content}"
+            action_prompt += pass_cfg["closing"]
 
-            forecast_pass = await _call_model(
+            action_user_content = final_user_message
+            if pass_cfg.get("profile"):
+                profile_block = build_profile(
+                    request.context.values if request.context else [],
+                    request.context.address if request.context else "",
+                )
+                if profile_block:
+                    action_user_content = f"{final_user_message}\n\n{profile_block}"
+
+            action_pass = await _call_model(
                 selected_model=selected_model,
-                user_content=final_user_message,
-                system_instruction=forecast_prompt,
+                user_content=action_user_content,
+                system_instruction=action_prompt,
                 use_tools=True,
-                tools_override=FORECAST_ONLY_TOOLS,
+                tools_override=pass_cfg["tools"],
             )
             # Replace tool_calls with the contracted second-pass result and fall
             # through to the action path below.
-            tool_calls = forecast_pass["tool_calls"]
-            ai_text = forecast_pass["text"]
-            print(f"[DEBUG] Forecast pass tool calls: {[t['name'] for t in tool_calls]}")
+            tool_calls = action_pass["tool_calls"]
+            ai_text = action_pass["text"]
+            print(f"[DEBUG] Action pass tool calls: {[t['name'] for t in tool_calls]}")
 
         # 6. Handle action tools (write_to_cell, create_chart, apply_forecast)
         action_tools = [t for t in tool_calls if t["name"] not in app.state.skill_text_names]
@@ -1195,21 +1311,24 @@ async def chat_endpoint(request: ChatRequest):
 
     except Exception as e:
         # Even errors get an audit entry — auditors care about silent failures
-        # too. Excerpt only, no stack trace dumped to the file.
+        # too. Excerpt only, no stack trace dumped to the file. Some exceptions
+        # (httpx.ReadTimeout, anyio stream errors) stringify to "", which once
+        # produced a blank "Backend error:" — repr() as fallback never does.
+        err_text = str(e) or repr(e)
         if audit_enabled:
             audit.append_event(
                 "chat_response",
                 {
                     "skill_used": False,
                     "tool_calls_proposed": [],
-                    "reply_excerpt": f"[backend error] {str(e)[:300]}",
+                    "reply_excerpt": f"[backend error] {err_text[:300]}",
                     "error": True,
                 },
                 request_id=request_id,
                 enabled=audit_enabled,
             )
         return {
-            "reply": f"⚠️ Backend error: {str(e)}",
+            "reply": f"⚠️ Backend error: {err_text}",
             "tool_calls": [],
             "skill_used": False,
             "review": None,
@@ -1280,6 +1399,13 @@ def _unwrap_tool_result(result) -> dict:
     most version-stable source for an exact-shape payload. structuredContent is
     used as a fallback.
     """
+    # A server-side exception arrives as isError=True with the error message as
+    # PLAIN TEXT content. json.loads on that text would bury the real message
+    # under "Expecting value: line 1 column 1 (char 0)" — check first and
+    # re-raise the actual error so it reaches the UI and the audit trail.
+    if getattr(result, "isError", False):
+        texts = [getattr(b, "text", "") for b in getattr(result, "content", []) or []]
+        raise RuntimeError("; ".join(t for t in texts if t) or "MCP tool call failed")
     for block in getattr(result, "content", []) or []:
         text = getattr(block, "text", None)
         if text:
@@ -1364,8 +1490,8 @@ async def review_endpoint(request: ReviewRequest):
 @app.post("/variance")
 async def variance_endpoint(request: VarianceRequest):
     """
-    Year-over-year variance analysis over one or two financial statements
-    (IS and/or BS). Read-only — never writes cells. The deterministic layer
+    Year-over-year variance analysis over one to three financial statements
+    (any subset of IS/BS/CF). Read-only — never writes cells. The deterministic layer
     (deltas, tie-out checks, cross-statement ratios) and the LLM passes run in
     the excelcat-analysis MCP server; this endpoint owns request_id generation,
     loads the variance contract from excelcat-skills, and keeps the audit
@@ -1414,11 +1540,11 @@ async def variance_endpoint(request: VarianceRequest):
             error=True,
         )
 
-    valid_roles = {"IS", "BS"}
+    valid_roles = {"IS", "BS", "CF"}
     roles = [s.role for s in request.statements]
     if not roles or any(r not in valid_roles for r in roles) or len(set(roles)) != len(roles):
         return _error_result(
-            "Variance analysis expects one or two statements with distinct roles 'IS' and 'BS'."
+            "Variance analysis expects one to three statements with distinct roles 'IS', 'BS', 'CF'."
         )
 
     # Guard: Pass A puts each whole grid in front of the LLM, so a polluted used
@@ -1473,3 +1599,233 @@ async def variance_endpoint(request: VarianceRequest):
         return _error_result(f"Variance analysis is temporarily unavailable (analysis call failed: {e}).")
 
     return _finish(result)
+
+
+# ── DCF Valuation (chip → /dcf → apply_dcf_template through the hook) ──────────
+MIN_DCF_HISTORY_YEARS = 3
+
+
+def _fmt_dcf_series(name: str, vals: Optional[list], as_pct: bool = False) -> str:
+    """One line of the /dcf facts block: '- name: v1, v2, …' ('n/a' per gap)."""
+    if not vals:
+        return f"- {name}: not derivable"
+    fmt = (lambda v: f"{v * 100:.1f}%") if as_pct else (lambda v: f"{v:g}")
+    body = ", ".join("n/a" if v is None else fmt(v) for v in vals)
+    return f"- {name}: {body}"
+
+
+@app.post("/dcf")
+async def dcf_endpoint(request: DcfRequest):
+    """
+    DCF valuation. The deterministic layers (multi-year Pass A + FCF-driver
+    derivation) run in excelcat-analysis; this endpoint owns request_id
+    generation, the contract load, the single contracted LLM pass (restricted
+    to apply_dcf_template), the pre-write hook, the deterministic provenance
+    check of the declared historicals, and the audit chokepoint (`dcf_run`).
+    Returns the /chat response shape ({request_id, reply, tool_calls}) so the
+    frontend reuses the approval-card path unchanged.
+    """
+    audit_enabled = bool(request.audit_enabled)
+    request_id = str(uuid.uuid4())
+    selected_model = request.model or DEFAULT_MODEL
+
+    def _finish(reply: str, tool_calls: list, derived: Optional[dict] = None, *, error=False) -> dict:
+        payload = {
+            "addresses": [
+                {"role": s.role, "sheet": s.sheet, "address": s.address}
+                for s in request.statements
+            ],
+            "forecast_years": request.forecast_years,
+            "user_inputs": {
+                "shares": request.shares, "current_price": request.current_price,
+                "cash_override": request.cash_override, "debt_override": request.debt_override,
+                "user_note": request.user_note,
+            },
+            "model": selected_model,
+            "model_id": resolve_model_id(selected_model),
+            "reply_excerpt": (reply or "")[:400],
+            "tool_calls_proposed": [
+                {"name": t["name"], "args": t["args"]} for t in tool_calls
+            ],
+        }
+        if derived:
+            # The audited derivation record: years, series, drivers, provenance,
+            # coverage warnings — the facts every declared assumption traces to.
+            payload["derived"] = {
+                k: derived.get(k)
+                for k in ("years", "series", "drivers", "cash", "debt", "provenance", "warnings")
+            }
+        if error:
+            payload["error"] = True
+        audit.append_event("dcf_run", payload, request_id=request_id, enabled=audit_enabled)
+        resp = {"request_id": request_id, "reply": reply, "tool_calls": tool_calls}
+        if error:
+            resp["error"] = True
+        return resp
+
+    def _refuse(msg: str) -> dict:
+        return _finish(msg, [], error=True)
+
+    # ── Validation: distinct roles, IS + CF required, size guard ──
+    valid_roles = {"IS", "BS", "CF"}
+    roles = [s.role for s in request.statements]
+    if any(r not in valid_roles for r in roles) or len(set(roles)) != len(roles):
+        return _refuse("DCF expects statements with distinct roles 'IS', 'BS', 'CF'.")
+    if "IS" not in roles or "CF" not in roles:
+        missing = [r for r in ("IS", "CF") if r not in roles]
+        return _refuse(
+            f"A DCF needs both the Income Statement and the Cash Flow statement — "
+            f"missing: {', '.join(missing)}. The Balance Sheet is optional."
+        )
+    if not (3 <= request.forecast_years <= 10):
+        return _refuse("Forecast period must be between 3 and 10 years.")
+
+    MAX_DCF_ROWS, MAX_DCF_COLS = 200, 30
+    for s in request.statements:
+        n_rows = len(s.values)
+        n_cols = max((len(r) for r in s.values), default=0)
+        if n_rows > MAX_DCF_ROWS or n_cols > MAX_DCF_COLS:
+            return _refuse(
+                f"The used range of '{s.sheet or s.role}' is {n_rows} rows × {n_cols} columns — "
+                f"too large to analyse (limit {MAX_DCF_ROWS} × {MAX_DCF_COLS}). This usually "
+                "means stray cells outside the statement; clear them and try again."
+            )
+
+    session = getattr(app.state, "mcp_analysis", None)
+    if session is None:
+        return _refuse("DCF is temporarily unavailable (analysis service not running).")
+    try:
+        contract_md = await _load_skill_content("dcf") or ""
+    except RuntimeError:
+        return _refuse("DCF is temporarily unavailable (skills service not running).")
+    if not contract_md:
+        return _refuse("DCF is temporarily unavailable (dcf.md contract missing).")
+
+    # ── Deterministic derivation (Pass A + driver layer, in the analysis server) ──
+    try:
+        derived = _unwrap_tool_result(await session.call_tool(
+            "derive_fcf_drivers",
+            {
+                "statements": [
+                    {"role": s.role, "values": s.values, "address": s.address, "sheet": s.sheet}
+                    for s in request.statements
+                ],
+                "model": selected_model,
+            },
+        ))
+    except Exception as e:
+        return _refuse(f"DCF is temporarily unavailable (analysis call failed: {str(e) or repr(e)}).")
+
+    if derived.get("error"):
+        return _refuse(derived["error"])
+    years = derived.get("years") or []
+    if len(years) < MIN_DCF_HISTORY_YEARS:
+        return _refuse(
+            f"DCF needs at least {MIN_DCF_HISTORY_YEARS} historical years of IS and CF data; "
+            f"only {len(years)} usable year(s) found ({', '.join(map(str, years))})."
+        )
+
+    # User overrides beat BS-located figures (the setup card said so).
+    cash = request.cash_override if request.cash_override is not None else derived.get("cash")
+    debt = request.debt_override if request.debt_override is not None else derived.get("debt")
+    derived_warnings = list(derived.get("warnings") or [])
+    limited_history = len(years) < 5
+
+    # ── One contracted pass: derived facts in, apply_dcf_template out ──
+    series = derived.get("series") or {}
+    drivers = derived.get("drivers") or {}
+
+    facts = "\n".join(
+        [f"Historical years: {', '.join(map(str, years))}"]
+        + [_fmt_dcf_series(n, series.get(n)) for n in ("revenue", "ebit", "taxes", "dna", "capex", "dnwc")]
+        + ["Derived driver ratios (historical):"]
+        + [_fmt_dcf_series(n, drivers.get(n), as_pct=True) for n in (
+            "revenue_growth", "ebit_margin", "tax_pct_ebit",
+            "dna_pct_sales", "capex_pct_sales", "dnwc_pct_sales")]
+        + [f"Cash (latest): {'unknown' if cash is None else f'{cash:g}'}",
+           f"Debt (latest): {'unknown' if debt is None else f'{debt:g}'}",
+           f"Shares outstanding: {'not supplied' if request.shares is None else f'{request.shares:g}'}",
+           f"Current share price: {'not supplied' if request.current_price is None else f'{request.current_price:g}'}",
+           f"Requested forecast years: {request.forecast_years}"]
+        + ([f"Coverage warnings: {'; '.join(derived_warnings)}"] if derived_warnings else [])
+        + (["Note: only "
+            f"{len(years)} historical years — state in the rationale that the driver basis is a limited trend."]
+           if limited_history else [])
+    )
+
+    dcf_prompt = (
+        "You are ExcelCat's DCF builder. Follow the skill contract below exactly.\n\n"
+        f"── SKILL INSTRUCTIONS (follow these precisely) ──\n{contract_md}\n\n"
+        "You MUST respond by calling apply_dcf_template exactly once, with both "
+        "sheets complete per the template. The historical series above are "
+        "authoritative — echo them exactly; never invent or adjust a figure."
+    )
+    user_content = f"Build the DCF from these derived facts:\n\n{facts}"
+    if request.user_note:
+        user_content += (
+            f"\n\nThe user rejected a previous proposal with this feedback — "
+            f"address it in the new assumptions:\n{request.user_note}"
+        )
+    try:
+        dcf_pass = await _call_model(
+            selected_model=selected_model,
+            user_content=user_content,
+            system_instruction=dcf_prompt,
+            use_tools=True,
+            tools_override=DCF_ONLY_TOOLS,
+            timeout_s=120,
+        )
+    except Exception as e:
+        return _finish(f"DCF proposal failed (model call: {str(e) or repr(e)}).", [], derived, error=True)
+
+    tool_calls = [t for t in dcf_pass["tool_calls"] if t["name"] == "apply_dcf_template"]
+    if not tool_calls:
+        # The model answered in prose (e.g. it judged the data unusable) —
+        # surface that honestly rather than forcing a card.
+        return _finish(dcf_pass["text"] or "The model did not produce a DCF proposal.",
+                       [], derived, error=True)
+    tool = tool_calls[0]
+
+    # ── Deterministic provenance check: the declared historicals must equal the
+    # derived series (which came from the source grids arithmetically). The
+    # hardcode-with-provenance policy is only auditable if actually checked. ──
+    provenance_warnings = []
+    declared_hist = (tool.get("args") or {}).get("historical") or {}
+    for name in ("revenue", "ebit", "taxes", "dna", "capex", "dnwc"):
+        declared = declared_hist.get(name)
+        derived_series = series.get(name)
+        if declared is None or derived_series is None:
+            continue
+        derived_nums = [v for v in derived_series if v is not None]
+        ok = len(declared) == len(derived_nums) and all(
+            isinstance(a, (int, float)) and abs(a - b) <= max(abs(b) * 5e-3, 1e-6)
+            for a, b in zip(declared, derived_nums)
+        )
+        if not ok:
+            provenance_warnings.append(
+                f"Declared historical {name} does not match the series derived from "
+                f"the source statements — the proposal's history is not the audited history."
+            )
+
+    hook_result = await pre_write_hook(
+        tool,
+        context_str=f"DCF build from statements: {facts}",
+        context=None,
+        selected_model=selected_model,
+        request_id=request_id,
+        audit_enabled=audit_enabled,
+        reflexion_cache={},
+    )
+    all_warnings = provenance_warnings + hook_result["warnings"] + derived_warnings
+    enriched_tool = {
+        "name": tool["name"],
+        "args": tool["args"],
+        "hook_result": {
+            "status": "warning" if provenance_warnings else hook_result["status"],
+            "warnings": all_warnings,
+            "suggestions": hook_result.get("suggestions", []),
+            "checks_run": hook_result["checks_run"] + ["dcf_provenance"],
+            "review_meta": hook_result.get("review_meta"),
+        },
+    }
+    return _finish(dcf_pass["text"] or "", [enriched_tool], derived)

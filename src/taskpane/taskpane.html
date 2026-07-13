@@ -93,6 +93,10 @@
         <div class="chip" data-prompt="Write a one paragraph plain English analysis of the selected data">Analyse Data</div>
         <div class="chip" data-prompt="Create a chart for the selected data">Chart It</div>
       </div>
+      <!-- Forecast is deliberately chat-only (no chip): the user must supply
+           business context. This hint advertises the capability by MODELLING
+           that behaviour — the example prompt shows the context to include. -->
+      <div class="qa-hint">Tip: forecasting is chat-only — describe the business too, e.g. &ldquo;project the next 3 years from this trend; this is a high-growth tech company&rdquo;.</div>
 
       <div class="qa-label">Audit Tools</div>
       <!-- Audit tools. Each tool is a clickable row that runs a report; the
@@ -141,10 +145,34 @@
             <span class="audit-tool-run">RUN</span>
           </div>
           <div class="audit-tool-info" hidden>
-            <div class="ati-item"><span class="ati-label">What it checks</span><span class="ati-text">Compares this year against last year line by line and flags unusual movements.</span></div>
-            <div class="ati-item"><span class="ati-label">What it needs</span><span class="ati-text">A worksheet named <code>IS</code> or <code>Income Statement</code>.</span></div>
+            <div class="ati-item"><span class="ati-label">What it checks</span><span class="ati-text">Compares this year against last year line by line across the Income Statement, Balance Sheet and Cash Flow, flags unusual movements, and runs tie-out checks (does the balance sheet balance? does cash tie across statements?) plus cross-statement ratios.</span></div>
+            <div class="ati-item"><span class="ati-label">What it needs</span><span class="ati-text">At least one worksheet named <code>IS</code>/<code>Income Statement</code>, <code>BS</code>/<code>Balance Sheet</code> or <code>CF</code>/<code>Cash Flow</code> — it analyses whichever it finds.</span></div>
             <div class="ati-item"><span class="ati-label">Set a materiality threshold</span><span class="ati-text">Before it runs, you set a <em>clearly-trivial threshold</em>: line items whose change is smaller than this are set aside as trivial, so you focus on the moves that matter. A sensible default (≈ 1% of the largest figure) is pre-filled — overwrite it if you like.</span></div>
-            <div class="ati-item"><span class="ati-label">What you get</span><span class="ati-text">A year-on-year table plus suggested questions to put to the CFO.</span></div>
+            <div class="ati-item"><span class="ati-label">What you get</span><span class="ati-text">A year-on-year table per statement, tie-out results and ratios, plus suggested questions to put to the CFO. Click any table row to highlight its source cells in Excel.</span></div>
+            <div class="audit-tool-video" data-video="">
+              <div class="ati-video-placeholder">Demo video — coming soon</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="audit-tool-wrap">
+          <div class="audit-tool" id="chip-dcf">
+            <span class="audit-tool-icon">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 13V3M2 13h12"/><path d="M4 11l3-3 2.5 1.5L13 5"/><path d="M13 5v3M13 5h-3"/></svg>
+            </span>
+            <span class="audit-tool-text">
+              <span class="audit-tool-title">DCF Valuation</span>
+              <span class="audit-tool-desc">Build a discounted cash flow model</span>
+            </span>
+            <button class="audit-tool-info-btn" type="button" aria-label="Learn more about DCF Valuation" aria-expanded="false">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.25"/><path d="M8 7.25v3.75"/><circle cx="8" cy="4.9" r="0.7" fill="currentColor" stroke="none"/></svg>
+            </button>
+            <span class="audit-tool-run">RUN</span>
+          </div>
+          <div class="audit-tool-info" hidden>
+            <div class="ati-item"><span class="ati-label">What it builds</span><span class="ati-text">Two new sheets: a <code>WACC</code> tab (CAPM build-up) and a <code>DCF</code> tab — driver-based forecast, discounting, terminal value, and the bridge to an implied share price. Every assumption stays an editable cell.</span></div>
+            <div class="ati-item"><span class="ati-label">What it needs</span><span class="ati-text">At least the past <strong>3 years</strong> of historicals on worksheets named <code>IS</code>/<code>Income Statement</code> and <code>CF</code>/<code>Cash Flow</code>. A <code>BS</code> tab is optional (auto-locates cash and debt).</span></div>
+            <div class="ati-item"><span class="ati-label">You approve the assumptions</span><span class="ati-text">The AI suggests WACC inputs, terminal growth and the forecast drivers — each with a stated rationale — and nothing is written until you approve the card.</span></div>
             <div class="audit-tool-video" data-video="">
               <div class="ati-video-placeholder">Demo video — coming soon</div>
             </div>
@@ -156,6 +184,24 @@
 
   <!-- Input -->
   <div id="input-area">
+    <!-- Floating "new messages" pill — shown when content arrives while the
+         user has scrolled up; clicking jumps to the latest message. -->
+    <button id="jump-latest" class="jump-latest" type="button" hidden>↓ New messages</button>
+    <!-- Persistent quick-action bar: mirrors the empty-state chips + audit
+         tools so they stay reachable once a conversation has started (the
+         empty-state launcher is gone by then). Same data-prompt contract as
+         the empty-state chips — no hidden prompts. -->
+    <div class="qa-bar" id="qa-bar" hidden>
+      <button class="qa-bar-chip" type="button" data-prompt="Summarise the selected data">Summarise</button>
+      <button class="qa-bar-chip" type="button" data-prompt="Find outliers and anomalies in the selected data">Outliers</button>
+      <button class="qa-bar-chip" type="button" data-prompt="Clean and standardise the selected data">Clean</button>
+      <button class="qa-bar-chip" type="button" data-prompt="Write a one paragraph plain English analysis of the selected data">Analyse</button>
+      <button class="qa-bar-chip" type="button" data-prompt="Create a chart for the selected data">Chart</button>
+      <span class="qa-bar-sep" aria-hidden="true"></span>
+      <button class="qa-bar-chip audit" type="button" id="qa-bar-review">Review</button>
+      <button class="qa-bar-chip audit" type="button" id="qa-bar-variance">Variance</button>
+      <button class="qa-bar-chip audit" type="button" id="qa-bar-dcf">DCF</button>
+    </div>
     <div class="selection-pill" id="selection-pill">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
         <rect x="2" y="2" width="12" height="12" rx="2"/>
@@ -167,8 +213,11 @@
     <div class="textarea-wrap">
       <textarea id="chat-input" rows="1" placeholder="Ask anything about your spreadsheet…"></textarea>
       <button id="send-btn" title="Send (Enter)">
-        <svg viewBox="0 0 16 16" fill="currentColor">
+        <svg class="icon-send" viewBox="0 0 16 16" fill="currentColor">
           <path d="M2.5 13.5l11-5.5-11-5.5v4.4l7 1.1-7 1.1z"/>
+        </svg>
+        <svg class="icon-stop" viewBox="0 0 16 16" fill="currentColor">
+          <rect x="4" y="4" width="8" height="8" rx="1.5"/>
         </svg>
       </button>
     </div>

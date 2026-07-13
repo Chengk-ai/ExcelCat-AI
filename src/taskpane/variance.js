@@ -1,28 +1,48 @@
-// Variance chip flow: find the Income Statement and/or Balance Sheet tabs →
-// materiality prompt (one shared threshold) → /variance → variance report card
-// (tie-out checks, per-statement YoY tables, cross-statement ratios).
+// Variance chip flow: find the Income Statement / Balance Sheet / Cash Flow
+// tabs → materiality prompt (one shared threshold) → /variance → variance
+// report card (tie-out checks, per-statement YoY tables, cross-statement ratios).
 
-import { state, API_BASE, messagesEl, emptyState, sendBtn, escapeHtml } from './core';
-import { addMessage, showTyping, hideTyping } from './messages';
-import { readSheetByName, IS_SHEET_NAMES, BS_SHEET_NAMES, selectRangeOnSheet } from './excel';
+import { state, API_BASE, messagesEl, escapeHtml, setSendBusy, showToast } from './core';
+import { addMessage, showTyping, hideTyping, hideEmptyState, scrollMessages } from './messages';
+import { readSheetByName, IS_SHEET_NAMES, BS_SHEET_NAMES, CF_SHEET_NAMES, selectRangeOnSheet } from './excel';
 
-const ROLE_NAMES = { IS: 'Income Statement', BS: 'Balance Sheet' };
+const ROLE_NAMES = { IS: 'Income Statement', BS: 'Balance Sheet', CF: 'Cash Flow Statement' };
+
+// Variance legitimately runs multiple LLM passes over whole statements —
+// the staged wording keeps a 1–2 minute wait from feeling stalled.
+const VARIANCE_STAGES = [
+  [0,  'Reading the statements…'],
+  [8,  'Computing year-on-year movements…'],
+  [30, 'Scanning for anomalies…'],
+  [75, 'Still working — full-statement analysis can take a couple of minutes…'],
+];
 
 // ── Variance Analysis ──────────────────────────────────
 export async function triggerVariance() {
-  let isSheet = null, bsSheet = null;
-  try { isSheet = await readSheetByName(IS_SHEET_NAMES); } catch { isSheet = null; }
-  try { bsSheet = await readSheetByName(BS_SHEET_NAMES); } catch { bsSheet = null; }
-  if (!isSheet && !bsSheet) {
-    addMessage('assistant', 'I couldn’t find an Income Statement or Balance Sheet tab. Rename the relevant sheets to "IS"/"Income Statement" or "BS"/"Balance Sheet" and try again.');
+  if (state.isTyping) {
+    showToast('Hold on — another request is still running.');
+    return;
+  }
+  // The three statement reads are independent — run them concurrently
+  // (Office.js queues the underlying requests; this saves two round-trips).
+  // Same pattern as dcf.js.
+  const [isSheet, bsSheet, cfSheet] = await Promise.all([
+    readSheetByName(IS_SHEET_NAMES).catch(() => null),
+    readSheetByName(BS_SHEET_NAMES).catch(() => null),
+    readSheetByName(CF_SHEET_NAMES).catch(() => null),
+  ]);
+  if (!isSheet && !bsSheet && !cfSheet) {
+    addMessage('assistant', 'I couldn’t find an Income Statement, Balance Sheet or Cash Flow tab. Rename the relevant sheets to "IS"/"Income Statement", "BS"/"Balance Sheet" or "CF"/"Cash Flow" and try again.');
     return;
   }
 
-  // Whatever exists is what gets analysed: IS only, BS only, or both — both
-  // unlocks the tie-out checks and the cross-statement ratio layer.
+  // Whatever exists is what gets analysed — any subset of IS/BS/CF. Each
+  // additional statement unlocks the tie-out checks and cross-statement
+  // ratios that need it.
   const statements = [];
   if (isSheet) statements.push({ role: 'IS', sheet: isSheet.name, address: isSheet.address, values: isSheet.values, formulas: isSheet.formulas });
   if (bsSheet) statements.push({ role: 'BS', sheet: bsSheet.name, address: bsSheet.address, values: bsSheet.values, formulas: bsSheet.formulas });
+  if (cfSheet) statements.push({ role: 'CF', sheet: cfSheet.name, address: cfSheet.address, values: cfSheet.values, formulas: cfSheet.formulas });
 
   // Establish materiality first (audit discipline): one shared clearly-trivial
   // threshold, pre-filled with a suggestion, then run once the user confirms.
@@ -64,12 +84,12 @@ function suggestSharedThreshold(statements) {
 // We avoid window.prompt() — it's unreliable in the Office webview. onRun fires
 // once, when the user clicks Run (or presses Enter).
 function promptMateriality(suggested, label, isDual, onRun) {
-  if (messagesEl.contains(emptyState)) messagesEl.removeChild(emptyState);
+  hideEmptyState();
 
   const help = 'Line items whose absolute change is smaller than this are treated as trivial and excluded. '
     + 'In the sheets’ own units; suggested ≈ 1% of the largest figure'
     + (isDual
-      ? ', taken as the smaller across the detected statements. Also used as the tolerance for the balance-sheet checks.'
+      ? ', taken as the smaller across the detected statements. Also used as the tolerance for the tie-out checks.'
       : '.');
 
   const wrap = document.createElement('div');
@@ -102,21 +122,22 @@ function promptMateriality(suggested, label, isDual, onRun) {
   input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
 
   messagesEl.appendChild(wrap);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  // The prompt card is a direct response to the user's click — always follow.
+  scrollMessages(true);
   input.focus();
   input.select();
 }
 
 async function runVariance(statements, clearlyTrivial) {
-  state.isTyping = true;
-  sendBtn.disabled = true;
-  showTyping();
-  const stop = () => { state.isTyping = false; sendBtn.disabled = false; hideTyping(); };
+  setSendBusy(true);
+  showTyping(VARIANCE_STAGES);
 
   // 150s timeout — variance legitimately runs multiple LLM passes over whole
   // statements, so it gets more budget than chat; but a wedged backend must
   // still surface as an error, not an infinite spinner.
   const controller = new AbortController();
+  state.activeController = controller;
+  state.stopRequested = false;
   const timer = setTimeout(() => controller.abort(), 150_000);
 
   try {
@@ -131,19 +152,27 @@ async function runVariance(statements, clearlyTrivial) {
       }),
       signal: controller.signal,
     });
-    clearTimeout(timer);
 
-    stop();
     if (!resp.ok) throw new Error(`Server error: ${resp.status}`);
     const data = await resp.json();
+    hideTyping();
     renderVarianceReport(data, statements.map(s => s.sheet).join(' + '));
   } catch (err) {
-    clearTimeout(timer);
-    stop();
-    const msg = err.name === 'AbortError'
-      ? '⚠️ Variance analysis timed out (150s). The backend may be unresponsive.'
-      : `⚠️ Variance analysis failed: ${err.message}`;
+    hideTyping();
+    let msg;
+    if (err.name === 'AbortError' && state.stopRequested) {
+      msg = '⏹️ Stopped — the analysis was cancelled.';
+    } else if (err.name === 'AbortError') {
+      msg = '⚠️ Variance analysis timed out after 150 seconds — the backend looks unresponsive.';
+    } else {
+      msg = `⚠️ Variance analysis failed: ${err.message}`;
+    }
     addMessage('assistant', msg);
+  } finally {
+    clearTimeout(timer);
+    state.activeController = null;
+    setSendBusy(false);
+    hideTyping();
   }
 }
 
@@ -250,6 +279,13 @@ function statementHtml(st, isDual) {
       <tbody>${rowsHtml}</tbody>
     </table>` : '';
 
+  // Backend coverage guard: structure recognition mapped fewer rows than
+  // actually hold figures. Shown ABOVE the table — the caveat must be read
+  // before the numbers are trusted.
+  const warningHtml = st.warning
+    ? `<div class="variance-skipped">⚠ ${escapeHtml(st.warning)}</div>`
+    : '';
+
   // Skipped lines: located as line items but non-numeric in one or both years,
   // so no delta was computed. The audit log records them; the UI must say so
   // too — silently dropping rows would undercut the audit story.
@@ -258,25 +294,34 @@ function statementHtml(st, isDual) {
     ? `<div class="variance-skipped">${skipped.length} line item${skipped.length !== 1 ? 's' : ''} skipped (non-numeric value in one or both years): ${escapeHtml(skipped.map(s => s.label).filter(Boolean).join(', '))}</div>`
     : '';
 
-  return `${isDual ? head : ''}${tableHtml}${skippedHtml}`;
+  return `${isDual ? head : ''}${warningHtml}${tableHtml}${skippedHtml}`;
 }
 
-// Cross-statement ratios (dual mode only): every figure was computed in Python
-// from located cells — a ratio that couldn't be computed is stated with its
-// reason, never silently dropped.
+// Cross-statement ratios (multi-statement modes): every figure was computed in
+// Python from located cells — a ratio that couldn't be computed is stated with
+// its reason, never silently dropped.
 function ratiosHtml(ratios) {
   if (!ratios.length) return '';
-  const fmtRatio = (v, unit) => (typeof v === 'number' && isFinite(v))
-    ? (unit === 'pct' ? `${(v * 100).toFixed(1)}%` : v.toFixed(1)) : '—';
+  const fmtRatio = (v, unit) => {
+    if (typeof v !== 'number' || !isFinite(v)) return '—';
+    if (unit === 'pct') return `${(v * 100).toFixed(1)}%`;
+    if (unit === 'x') return `${v.toFixed(2)}x`;
+    return v.toFixed(1);
+  };
+  const fmtRatioDelta = (d, unit) => {
+    if (typeof d !== 'number' || !isFinite(d)) return '—';
+    const sign = d >= 0 ? '+' : '';
+    if (unit === 'pct') return `${sign}${(d * 100).toFixed(1)}pp`;
+    if (unit === 'x') return `${sign}${d.toFixed(2)}x`;
+    return `${sign}${d.toFixed(1)}`;
+  };
   const ok = ratios.filter(r => r.status === 'ok');
   const skipped = ratios.filter(r => r.status !== 'ok');
 
   const rowsHtml = ok.map(r => {
     const neg = (typeof r.delta === 'number' && r.delta < 0);
     const dir = neg ? 'neg' : 'pos';
-    const delta = (typeof r.delta === 'number' && isFinite(r.delta))
-      ? `${r.delta >= 0 ? '+' : ''}${r.unit === 'pct' ? (r.delta * 100).toFixed(1) + 'pp' : r.delta.toFixed(1)}`
-      : '—';
+    const delta = fmtRatioDelta(r.delta, r.unit);
     return `
       <tr>
         <td class="vt-label">${escapeHtml(r.label)}<div class="vr-basis">${escapeHtml(r.basis || '')}</div></td>
@@ -296,8 +341,17 @@ function ratiosHtml(ratios) {
     ? `<div class="variance-skipped">${skipped.map(r => `${escapeHtml(r.label)} skipped — ${escapeHtml(r.reason || '')}`).join(' · ')}</div>`
     : '';
 
+  // "Cross-statement" only when the computed ratios actually drew on more
+  // than one statement — a CF-only run producing an intra-CF ratio under a
+  // "Cross-statement" heading would misdescribe its own provenance.
+  const stmts = new Set();
+  ok.forEach(r => Object.values(r.inputs || {}).forEach(i => {
+    if (i && i.statement) stmts.add(i.statement);
+  }));
+  const heading = stmts.size > 1 ? 'Cross-statement ratios' : 'Ratios';
+
   return `
-    <div class="variance-stmt-head">Cross-statement ratios</div>
+    <div class="variance-stmt-head">${heading}</div>
     ${tableHtml}${skippedHtml}`;
 }
 
@@ -310,7 +364,7 @@ function renderVarianceReport(data, headLabel) {
   const summary = data.summary || '';
   const isDual = statements.length > 1;
 
-  if (messagesEl.contains(emptyState)) messagesEl.removeChild(emptyState);
+  hideEmptyState();
 
   // Badge: failed checks + anomalies → orange; computed-but-clean → green;
   // nothing computed → neutral.
@@ -354,7 +408,15 @@ function renderVarianceReport(data, headLabel) {
       <ul>${questions.map(q => `<li>${escapeHtml(q)}</li>`).join('')}</ul>
     </div>` : '';
 
-  const bodyParts = `${checksHtml(checks)}${statementsHtml}${materialityHtml}${ratiosHtml(ratios)}${anomaliesHtml}${questionsHtml}`;
+  // Click-to-highlight is invisible without a nudge — one hint line per
+  // report, only when there actually are clickable rows.
+  const anyClickable = statements.some(st =>
+    !st.error && (st.variance_table || []).length && st.sheet && parseOrigin(st.address));
+  const hintHtml = anyClickable
+    ? '<div class="variance-hint">Tip: click a table row to highlight its source cells in Excel.</div>'
+    : '';
+
+  const bodyParts = `${checksHtml(checks)}${statementsHtml}${hintHtml}${materialityHtml}${ratiosHtml(ratios)}${anomaliesHtml}${questionsHtml}`;
   const bodyHtml = bodyParts.trim()
     ? `<div class="review-report-body">${bodyParts}</div>`
     : '';
@@ -368,6 +430,7 @@ function renderVarianceReport(data, headLabel) {
       <div class="review-report">
         <div class="review-report-head">
           <div class="review-report-title">Variance Analysis</div>
+          <button class="review-report-rerun" type="button" title="Re-read the sheets and run again with a new threshold">↻ Re-run</button>
           <div class="review-report-badge ${badgeClass}">${badgeLabel}</div>
         </div>
         ${bodyHtml}
@@ -384,6 +447,11 @@ function renderVarianceReport(data, headLabel) {
     });
   });
 
+  // Re-run: fresh sheet read + a new materiality prompt (pre-filled again).
+  // triggerVariance itself guards against a request already in flight.
+  const rerunBtn = wrap.querySelector('.review-report-rerun');
+  if (rerunBtn) rerunBtn.addEventListener('click', () => triggerVariance());
+
   messagesEl.appendChild(wrap);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  scrollMessages();
 }

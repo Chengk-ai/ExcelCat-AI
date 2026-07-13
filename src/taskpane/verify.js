@@ -21,6 +21,18 @@ function _verifySubject(toolCall) {
     const n = Array.isArray(args.cells) ? args.cells.length : 0;
     return `apply_pattern · ${args.range}${n ? ` (${n} cells)` : ''}`;
   }
+  if (name === 'apply_cleaning') {
+    const n = Array.isArray(args.cells) ? args.cells.length : 0;
+    return `apply_cleaning · ${n} cell${n === 1 ? '' : 's'}`;
+  }
+  if (name === 'apply_forecast') {
+    const n = Array.isArray(args.cells) ? args.cells.length : 0;
+    return `apply_forecast · ${n} cell${n === 1 ? '' : 's'}`;
+  }
+  if (name === 'apply_dcf_template') {
+    const n = (args.sheets || []).reduce((t, s) => t + ((s.cells || []).length), 0);
+    return `apply_dcf_template · ${n} cells → WACC + DCF`;
+  }
   return name;
 }
 
@@ -32,6 +44,19 @@ function _verifyPayload(toolCall) {
   if (name === 'write_to_cell') return args.value ?? '';
   if (name === 'create_chart')  return args.title ? `${args.chart_type} · "${args.title}"` : args.chart_type ?? '';
   if (name === 'apply_formula_pattern') return args.pattern ?? '';
+  if (name === 'apply_cleaning') {
+    const fixes = Array.isArray(args.fix_types) ? args.fix_types : [];
+    return fixes.length ? `mechanical fixes: ${[...new Set(fixes)].join(', ')}` : '';
+  }
+  if (name === 'apply_forecast') {
+    const rate = typeof args.assumed_growth_rate === 'number'
+      ? ` · assumed ${(args.assumed_growth_rate * 100).toFixed(0)}%` : '';
+    return `${args.method || 'forecast'}${rate}`;
+  }
+  if (name === 'apply_dcf_template') {
+    const pct = v => (typeof v === 'number' && isFinite(v)) ? `${(v * 100).toFixed(1)}%` : '?';
+    return `WACC ${pct(args.wacc)} · TGR ${pct(args.terminal_growth)} · ${args.forecast_years ?? '?'}y forecast`;
+  }
   return Object.keys(args).length ? JSON.stringify(args) : '';
 }
 

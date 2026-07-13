@@ -5,15 +5,31 @@
 // See the note in chat.js about the deliberate chat ⇄ approval import cycle.
 
 import { state, messagesEl, escapeHtml } from './core';
-import { addMessage } from './messages';
+import { addMessage, scrollMessages } from './messages';
 import { getAIResponse } from './chat';
-import { writeToCellTool, createNativeChart } from './excel';
+import { writeToCellTool, createNativeChart, writeCellsToSheet, selectionContextLabel } from './excel';
+import { retryDCF } from './dcf';
 import { postAuditDecision } from './audit';
-import { markVerifyDecision } from './verify';
+import { markVerifyDecision, appendVerifyLog } from './verify';
 
 // ── Approval flow (Step 2: minimal) ────────────────────
 // Tracks pending tool_calls awaiting user decision.
 state.pendingApprovals = state.pendingApprovals || {};
+
+// Present a /chat-shaped response's tool_calls: tag each with the audit
+// identifiers (request_id + tool_index — how approval decisions land in the
+// same trail as the proposal), then render the verify-log entry and the
+// approval card. Shared by every endpoint that returns the tool_calls shape
+// (chat.js, dcf.js) so the tagging logic can't drift between them.
+export function presentToolCalls(data) {
+  (data.tool_calls || []).forEach((tool, toolIndex) => {
+    const approvalId = `appr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    tool.__requestId = data.request_id || null;
+    tool.__toolIndex = toolIndex;
+    appendVerifyLog(tool, approvalId);
+    renderApprovalCard(tool, approvalId);
+  });
+}
 
 export function renderApprovalCard(toolCall, approvalId) {
   // approvalId is supplied by the caller so the verify-log entry and the
@@ -67,6 +83,43 @@ export function renderApprovalCard(toolCall, approvalId) {
         <div class="batch-rows">${rowsHtml}</div>
       `;
     }
+  } else if (toolCall.name === 'apply_cleaning') {
+    // Cleaning batch — the card IS the diff: every cell's old → new with its
+    // declared fix type, plus the advisory notes that were NOT actioned.
+    const a = toolCall.args || {};
+    const cells = a.cells || [];
+    const olds = a.old_values || [];
+    const news = a.new_values || [];
+    const fixes = a.fix_types || [];
+    const rowsHtml = cells.map((c, k) => `
+      <div class="batch-row">
+        <code class="batch-cell">${escapeHtml(c)}</code>
+        <code class="batch-value old">${escapeHtml(olds[k] ?? '')}</code>
+        <span class="batch-arrow">→</span>
+        <code class="batch-value">${escapeHtml(news[k] ?? '')}</code>
+        <span class="vt-tag">${escapeHtml(fixes[k] ?? '')}</span>
+      </div>`).join('');
+    // Notes arrive as an array of plain sentences (contract v5). Defensive:
+    // older/looser model output may still be one markdown-ish string — split
+    // it on newlines and strip bullets/bold markers so the card never shows
+    // a wall of raw asterisks.
+    const noteItems = (Array.isArray(a.notes) ? a.notes : String(a.notes || '').split(/\r?\n+/))
+      .map(s => String(s).replace(/\*\*/g, '').replace(/^\s*[-•*]\s*/, '').trim())
+      .filter(Boolean);
+    const notesHtml = noteItems.length ? `
+      <div class="clean-notes">
+        <div class="clean-notes-title">Advisory — not actioned</div>
+        <ul>${noteItems.map(n => `<li>${escapeHtml(n)}</li>`).join('')}</ul>
+      </div>` : '';
+    description = `
+      <div class="batch-summary">
+        Clean <strong>${cells.length} cell${cells.length !== 1 ? 's' : ''}</strong> — mechanical fixes, old → new below
+      </div>
+      <div class="batch-rows">${rowsHtml}</div>
+      ${notesHtml}
+    `;
+  } else if (toolCall.name === 'apply_dcf_template') {
+    description = dcfDescriptionHtml(toolCall.args || {});
   } else {
     description = `Run <code>${escapeHtml(toolCall.name)}</code>`;
   }
@@ -82,7 +135,7 @@ export function renderApprovalCard(toolCall, approvalId) {
   // - batch (apply_formula_pattern): never offer "Use AI's version" — the
   //   reflexion suggestion is on the sample formula and we'd need symbolic
   //   re-templating to apply it across N rows. Skipped intentionally.
-  const isBatch = toolCall.name === 'apply_formula_pattern' || toolCall.name === 'apply_forecast';
+  const isBatch = toolCall.name === 'apply_formula_pattern' || toolCall.name === 'apply_forecast' || toolCall.name === 'apply_cleaning' || toolCall.name === 'apply_dcf_template';
   let actionsHtml;
   if (status === 'suggestion' && suggestions.length > 0 && !isBatch) {
     actionsHtml = `
@@ -133,7 +186,63 @@ export function renderApprovalCard(toolCall, approvalId) {
     </div>
   `;
   messagesEl.appendChild(wrap);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  scrollMessages();
+}
+
+// DCF approval-card body: the assumptions and their rationale ARE the
+// decision surface ("AI suggests, user approves"), so they come first —
+// CAPM block → WACC result, TGR, then the per-year driver rows. The raw
+// cell batch follows, collapsed per sheet, for the full audit picture.
+const DCF_DRIVER_LABELS = {
+  revenue_growth: 'Revenue growth', ebit_margin: 'EBIT margin',
+  tax_pct_ebit: 'Tax % of EBIT', dna_pct_sales: 'D&A % of sales',
+  capex_pct_sales: 'CapEx % of sales', dnwc_pct_sales: 'ΔNWC % of sales',
+};
+
+function dcfDescriptionHtml(a) {
+  const pct = v => (typeof v === 'number' && isFinite(v)) ? `${(v * 100).toFixed(1)}%` : '—';
+  const num = v => (typeof v === 'number' && isFinite(v)) ? v.toLocaleString('en-GB') : '—';
+  const rat = a.rationale || {};
+  const comp = a.wacc_components || {};
+
+  const capmHtml = `
+    <div class="batch-pattern">WACC: <code>${pct(a.wacc)}</code>
+      (Rf ${pct(comp.rf)}, β ${typeof comp.beta === 'number' ? comp.beta.toFixed(2) : '—'}, MRP ${pct(comp.mrp)},
+      Kd ${pct(comp.cost_of_debt)}, tax ${pct(comp.tax_rate)}, D ${num(comp.debt)} / E ${num(comp.equity)})
+      ${rat.wacc ? `<div class="vr-basis">${escapeHtml(rat.wacc)}</div>` : ''}</div>
+    <div class="batch-pattern">Terminal growth: <code>${pct(a.terminal_growth)}</code>
+      ${rat.terminal_growth ? `<div class="vr-basis">${escapeHtml(rat.terminal_growth)}</div>` : ''}</div>`;
+
+  const drivers = a.drivers || {};
+  const driversHtml = Object.keys(DCF_DRIVER_LABELS).map(k => {
+    const vals = drivers[k];
+    if (!Array.isArray(vals) || !vals.length) return '';
+    const series = vals.map(pct).join(', ');
+    const why = rat[k] ? `<div class="vr-basis">${escapeHtml(rat[k])}</div>` : '';
+    return `<div class="batch-pattern">${DCF_DRIVER_LABELS[k]}: <code>${series}</code>${why}</div>`;
+  }).join('');
+
+  const sheets = a.sheets || [];
+  const nCells = sheets.reduce((n, s) => n + ((s.cells || []).length), 0);
+  const sheetsHtml = sheets.map(s => {
+    const cells = s.cells || [];
+    const values = s.values || [];
+    const rowsHtml = cells.map((c, k) =>
+      `<div class="batch-row"><code class="batch-cell">${escapeHtml(c)}</code><span class="batch-arrow">←</span><code class="batch-value">${escapeHtml(String(values[k] ?? ''))}</code></div>`
+    ).join('');
+    return `<div class="batch-pattern">Sheet <strong>${escapeHtml(s.name || '')}</strong> (${cells.length} cells)</div>
+      <div class="batch-rows">${rowsHtml}</div>`;
+  }).join('');
+
+  return `
+    <div class="batch-summary">
+      DCF valuation — <strong>${nCells} cells</strong> across new sheets <strong>WACC</strong> + <strong>DCF</strong>
+    </div>
+    ${capmHtml}
+    ${driversHtml}
+    <div class="batch-pattern">After approval you can edit any assumption cell (WACC inputs, TGR, the driver rows) — the whole valuation recalculates.</div>
+    ${sheetsHtml}
+  `;
 }
 
 // Render the warnings / suggestions block for an approval card.
@@ -193,12 +302,44 @@ export async function approveToolCall(approvalId) {
       await createNativeChart(tool.args.chart_type, tool.args.title || 'AI Generated Chart');
       markApprovalResolved(approvalId, 'approved', `✓ Created ${tool.args.chart_type} chart`, 'approved');
       postAuditDecision(tool.__requestId, tool.__toolIndex, 'approve');
-    } else if (tool.name === 'apply_formula_pattern' || tool.name === 'apply_forecast') {
+    } else if (tool.name === 'apply_dcf_template') {
+      // Two-sheet template write. WACC first, so the DCF sheet's =WACC!B16
+      // reference resolves the moment it lands. No rollback on partial
+      // failure (same policy as the other batch tools) — the resolution
+      // says exactly how far it got.
+      const sheets = (tool.args.sheets || []).slice()
+        .sort((a, b) => (a.name === 'WACC' ? -1 : 0) - (b.name === 'WACC' ? -1 : 0));
+      let writtenSheets = 0;
+      let failure = null;
+      for (const s of sheets) {
+        try {
+          await writeCellsToSheet(s.name, s.cells || [], s.values || [], { activate: s.name === 'DCF' });
+          writtenSheets += 1;
+        } catch (err) {
+          failure = { sheet: s.name, message: err.message };
+          break;
+        }
+      }
+      if (!failure) {
+        markApprovalResolved(approvalId, 'approved',
+          `✓ Created WACC + DCF sheets — edit any assumption cell to recalculate`, 'approved');
+        postAuditDecision(tool.__requestId, tool.__toolIndex, 'approve',
+          `wrote ${writtenSheets} template sheets (WACC, DCF)`);
+      } else {
+        markApprovalResolved(approvalId, 'rejected',
+          `⚠️ Partial: ${writtenSheets}/${sheets.length} sheets written — failed on '${failure.sheet}': ${failure.message}`,
+          'failed', `Failed on sheet ${failure.sheet}: ${failure.message}`);
+        postAuditDecision(tool.__requestId, tool.__toolIndex, 'failed',
+          `Partial template write: failed on sheet ${failure.sheet}: ${failure.message}`);
+      }
+    } else if (tool.name === 'apply_formula_pattern' || tool.name === 'apply_forecast' || tool.name === 'apply_cleaning') {
       // Batch write — loop and execute each cell→value. We do NOT roll
       // back on partial failure (Excel doesn't give us a clean tx). The
       // user gets a "Partial: K/N written" status with the failure detail.
+      // apply_cleaning carries its writes in new_values (values holds
+      // formulas for the other two batch tools).
       const cells = tool.args.cells || [];
-      const values = tool.args.values || [];
+      const values = tool.args.values || tool.args.new_values || [];
       let written = 0;
       let failure = null;
       for (let k = 0; k < cells.length; k++) {
@@ -316,6 +457,14 @@ export async function submitRetryForm(approvalId) {
   postAuditDecision(tool.__requestId, tool.__toolIndex, 'reject_retry', reason);
   delete state.pendingApprovals[approvalId];
 
+  // DCF proposals don't live in /chat — the retry re-runs /dcf with the same
+  // statements and the user's note feeding the assumptions pass.
+  if (tool.name === 'apply_dcf_template') {
+    addMessage('user', `[DCF proposal rejected — retry]\nReason: ${reason}`);
+    await retryDCF(reason);
+    return;
+  }
+
   // Build a structured retry message. Keeping it readable so the user can see
   // their own rejection in the chat history (audit trail), and Gemini gets
   // clear context about what was rejected and why.
@@ -333,7 +482,8 @@ export async function submitRetryForm(approvalId) {
   // Display the retry as a normal user message, then go through the standard
   // AI response path. The backend already handles conversation context, so
   // no backend change is needed.
-  addMessage('user', retryMessage);
+  const ctxLabel = selectionContextLabel();
+  addMessage('user', retryMessage, ctxLabel ? { context: ctxLabel } : undefined);
   await getAIResponse(retryMessage);
 }
 

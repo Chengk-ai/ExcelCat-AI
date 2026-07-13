@@ -7,19 +7,36 @@
 import {
   state, API_BASE, chatInput, sendBtn, selPill, clearSelBtn, btnClear, btnMenu,
   auditMenu, miAuditToggle, miAuditClear, miAuditDl, panelVerify, modelSelect,
+  jumpLatest, showToast,
 } from './core';
 import { setMenu, applyAuditUi } from './audit';
 import { refreshSelection } from './excel';
-import { renderMessages, copyMsg, addMessage } from './messages';
-import { handleSend } from './chat';
+import {
+  renderMessages, copyMsg, loadMessages, clearSavedMessages,
+  setRetryHandler, initScrollWatcher, scrollMessages,
+} from './messages';
+import { handleSend, getAIResponse } from './chat';
 import {
   approveToolCall, useAISuggestion, rejectToolCall,
   openRetryForm, closeRetryForm, submitRetryForm,
 } from './approval';
 import { triggerReview } from './review';
 import { triggerVariance } from './variance';
+import { triggerDCF } from './dcf';
 
 state.selectedModel = 'gemini-2.5-flash';
+
+// ── Restore persisted chat + shared wiring ─────────────
+// History survives task-pane reloads (Office unloads panes routinely);
+// renderMessages also syncs the empty-state ⇄ qa-bar visibility.
+loadMessages();
+renderMessages();
+// Retry handler injected here to avoid a messages → chat import cycle.
+setRetryHandler(text => getAIResponse(text));
+initScrollWatcher();
+if (jumpLatest) {
+  jumpLatest.addEventListener('click', () => scrollMessages(true));
+}
 
 if (modelSelect) {
   modelSelect.addEventListener('change', (e) => {
@@ -48,13 +65,17 @@ if (miAuditToggle) {
 }
 
 // Download audit trail as .md file. Backend renders on demand so the
-// hot path (/chat) never pays the full-file I/O cost.
+// hot path (/chat) never pays the full-file I/O cost. Failures surface
+// as a toast — "clicked and nothing happened" is the worst outcome.
 if (miAuditDl) {
   miAuditDl.addEventListener('click', async () => {
     setMenu(false);
     try {
       const resp = await fetch(`${API_BASE}/audit/view`);
-      if (!resp.ok) return;
+      if (!resp.ok) {
+        showToast("Couldn't download the audit trail — backend error");
+        return;
+      }
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -63,7 +84,7 @@ if (miAuditDl) {
       a.click();
       URL.revokeObjectURL(url);
     } catch {
-      // Non-fatal.
+      showToast("Couldn't download the audit trail — backend unreachable");
     }
   });
 }
@@ -73,10 +94,12 @@ if (miAuditClear) {
     setMenu(false);
     // No confirmation dialog — the audit history is the user's, deleting
     // it is a normal operation. Backend wipes both audit.jsonl and audit.md.
+    // The outcome is toasted either way so the click is never silent.
     try {
-      await fetch(`${API_BASE}/audit/clear`, { method: 'POST' });
+      const resp = await fetch(`${API_BASE}/audit/clear`, { method: 'POST' });
+      showToast(resp.ok ? 'Audit trail cleared' : "Couldn't clear the audit trail — backend error");
     } catch {
-      // Non-fatal: audit clear failures aren't worth interrupting the user.
+      showToast("Couldn't clear the audit trail — backend unreachable");
     }
   });
 }
@@ -109,24 +132,40 @@ chatInput.addEventListener('input', () => {
   chatInput.style.height = Math.min(chatInput.scrollHeight, 140) + 'px';
 });
 
-// ── Send on Enter ──────────────────────────────────────
+// ── Send on Enter / stop on Escape ─────────────────────
 chatInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  // isComposing / keyCode 229: Enter inside an IME composition (e.g.
+  // Chinese pinyin) confirms the candidate — it must not send the message.
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
     e.preventDefault();
     handleSend();
   }
+  if (e.key === 'Escape' && state.activeController) {
+    state.stopRequested = true;
+    state.activeController.abort();
+  }
 });
-sendBtn.addEventListener('click', handleSend);
 
-// ── Quick action chips ─────────────────────────────────
-document.querySelectorAll('.chip[data-prompt]').forEach(chip => {
+// Send OR stop: while a request is in flight the same button aborts it.
+sendBtn.addEventListener('click', () => {
+  if (state.activeController) {
+    state.stopRequested = true;
+    state.activeController.abort();
+    return;
+  }
+  handleSend();
+});
+
+// ── Quick action chips (empty-state launcher + persistent qa-bar) ──────
+document.querySelectorAll('.chip[data-prompt], .qa-bar-chip[data-prompt]').forEach(chip => {
   chip.addEventListener('click', () => {
     // No selection → the round-trip would only come back with "please select
-    // some data first". Say it locally instead (saves a wasted LLM call), but
-    // still stage the prompt so the user can select a range and just press
-    // Enter. Non-blocking: sending anyway remains the user's choice.
+    // some data first". Nag via toast — NOT a chat message, which would kill
+    // the empty-state launcher and pollute the history — and still stage the
+    // prompt so the user can select a range and just press Enter.
+    // Non-blocking: sending anyway remains the user's choice.
     if (!state.selectionContext) {
-      addMessage('assistant', 'Please select a data range in Excel first — the prompt is staged in the box, press Enter once you have.');
+      showToast('Select a data range in Excel first — the prompt is staged below.');
     }
     chatInput.value = chip.dataset.prompt;
     chatInput.dispatchEvent(new Event('input'));
@@ -134,18 +173,26 @@ document.querySelectorAll('.chip[data-prompt]').forEach(chip => {
   });
 });
 
-// Review Assumptions chip — triggers the review endpoint directly, not chat.
-const chipReview = document.getElementById('chip-review');
-if (chipReview) {
-  chipReview.addEventListener('click', () => triggerReview());
+// Review Assumptions — triggers the review endpoint directly, not chat.
+// Two entry points: the empty-state row and the persistent qa-bar chip.
+for (const id of ['chip-review', 'qa-bar-review']) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('click', () => triggerReview());
 }
 
-// Variance Analysis chip — reads the Income Statement tab and hits /variance.
-// Like Review, it bypasses chat (it sources two-year data from a named sheet,
-// not the active selection).
-const chipVariance = document.getElementById('chip-variance');
-if (chipVariance) {
-  chipVariance.addEventListener('click', () => triggerVariance());
+// Variance Analysis — reads the statement tabs and hits /variance. Like
+// Review, it bypasses chat (it sources two-year data from named sheets,
+// not the active selection). Same two entry points.
+for (const id of ['chip-variance', 'qa-bar-variance']) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('click', () => triggerVariance());
+}
+
+// DCF Valuation — reads IS/CF (+BS) tabs and hits /dcf. The chip carries no
+// hidden prompt; the behaviour lives in backend/skills/dcf.md.
+for (const id of ['chip-dcf', 'qa-bar-dcf']) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('click', () => triggerDCF());
 }
 
 // Audit-tool "learn more" (ⓘ) — toggles the inline explainer below the row.
@@ -188,6 +235,7 @@ clearSelBtn.addEventListener('click', () => {
 btnClear.addEventListener('click', () => {
   state.messages = [];
   state.pendingApprovals = {};
+  clearSavedMessages();
   renderMessages();
 
   // Reset the Verification Layer panel to match the empty chat state.

@@ -2,8 +2,8 @@
 excelcat-analysis — MCP server for generative analysis capabilities.
 
 The first capability built on the MCP foundation rather than inline in main.py:
-year-over-year variance analysis. Phase 2 extends it from one statement (IS) to
-one-or-two statements (IS and/or BS), always as the same sandwich:
+year-over-year variance analysis. Phase 3 extends it to any subset of the three
+primary statements (IS / BS / CF), always as the same sandwich:
 
   Pass A — structure recognition, once per statement: locate which rows are
            line items (now tagged with a semantic ROLE from a fixed vocabulary)
@@ -11,8 +11,8 @@ one-or-two statements (IS and/or BS), always as the same sandwich:
            ONLY structure; it never reports a figure.
   deterministic layer — pure Python on the real grid values:
            variance.compute_variance  (per statement: every YoY delta)
-           ties.check_ties            (BS present: accounting-identity proofs)
-           ratios.compute_ratios      (both present: cross-statement ratios)
+           ties.run_checks            (BS/CF present: accounting-identity proofs)
+           ratios.compute_ratios      (ratios whose statements are all present)
   Pass B — interpretation over ALL the computed facts: anomalies + "Questions
            for CFO", guided by the variance contract injected from
            excelcat-skills. It interprets figures; it never produces one.
@@ -40,9 +40,18 @@ from typing import Any, List, Optional
 from mcp.server.fastmcp import FastMCP
 
 from llm_client import _call_model, DEFAULT_MODEL
+
+# Per-LLM-call timeout for variance passes. The transport default (30s) is
+# sized for /chat's 90s budget, but variance gets 150s from the frontend
+# (variance.js) and Pass A ships a whole used range as JSON — a large BS
+# legitimately takes over 30s. 60s keeps the worst case (one Pass A + Pass B
+# both maxing out) inside the frontend budget; Pass A runs per-statement in
+# parallel, so statements don't stack.
+VARIANCE_CALL_TIMEOUT_S = 60
 from variance import compute_variance
-from ties import check_ties
+from ties import run_checks
 from ratios import compute_ratios
+from dcf import derive_fcf_drivers as _derive_fcf_drivers
 
 mcp = FastMCP("excelcat-analysis")
 
@@ -60,6 +69,11 @@ BS_ROLES = (
     "total_assets, receivables, inventory, ppe, cash, payables, debt, "
     "total_liabilities, total_equity, total_liabilities_and_equity, "
     "retained_earnings, dividends, other"
+)
+CF_ROLES = (
+    "net_income, operating_cash_flow, investing_cash_flow, financing_cash_flow, "
+    "capex, depreciation_amortisation, dividends_paid, interest_paid, tax_paid, "
+    "net_change_in_cash, opening_cash, closing_cash, other"
 )
 
 _STATEMENT_KINDS = {
@@ -80,6 +94,17 @@ _STATEMENT_KINDS = {
             "Inventory, PP&E; liability lines such as Payables, Debt; equity lines such "
             "as Retained earnings; and the totals rows — Total assets, Total "
             "liabilities, Total equity, or a combined Total liabilities and equity)"
+        ),
+    },
+    "CF": {
+        "name": "Cash Flow Statement",
+        "roles": CF_ROLES,
+        "items_hint": (
+            "actual cash-flow line items (Net income at the top of the operating "
+            "section; non-cash add-backs such as Depreciation & amortisation; the "
+            "section totals — net cash from operating, investing and financing "
+            "activities; Capital expenditure; Dividends paid; Net change in cash; "
+            "and the opening and closing cash rows)"
         ),
     },
 }
@@ -113,6 +138,7 @@ def _parse_json(text: str) -> Optional[dict]:
 async def _locate_structure(role: str, values: list, address: str, model: str) -> Optional[dict]:
     """Pass A for one statement: return the structure mapping, or None."""
     kind = _STATEMENT_KINDS[role]
+    n_rows = len(values)
     grid_json = json.dumps(values, default=str)
     prompt = f"""You are a financial-statement structure parser. You are given the
 used range of a {kind['name']} worksheet as a 2D array (row-major, 0-based indices).
@@ -131,6 +157,14 @@ none fits — do NOT invent new role names):
 Rules:
 - Use ONLY the two year columns. Ignore %-change columns, variance columns, and notes.
 - Do NOT include blank rows, section headers without figures, or unit/currency rows.
+- The grid has {n_rows} rows (indices 0 to {n_rows - 1}). Work through EVERY row to the
+  bottom before answering — statements often continue far past row 50, and the rows
+  near the bottom (section totals, closing balances) matter most. Do NOT stop
+  listing line items early.
+- When the SAME economic line appears both gross and net (e.g. "Purchases of
+  property and equipment" and "Purchases of property and equipment, net"), assign
+  the semantic role to the NET line and give the gross line the role "other" —
+  each role must resolve to one consistent row from run to run.
 - Return STRICT JSON only, no prose, exactly this shape:
 {{"current_col": <int>, "prior_col": <int>, "current_label": "<str>", "prior_label": "<str>",
   "line_items": [{{"label": "<str>", "row": <int>, "role": "<str>"}}]}}
@@ -138,7 +172,7 @@ Rules:
 Worksheet address: {address}
 Grid (2D array):
 {grid_json}"""
-    raw = (await _call_model(model, prompt))["text"]
+    raw = (await _call_model(model, prompt, timeout_s=VARIANCE_CALL_TIMEOUT_S))["text"]
     mapping = _parse_json(raw)
     if not mapping or not mapping.get("line_items"):
         return None
@@ -160,7 +194,11 @@ def _fmt_variance_table(rows: list) -> str:
 def _fmt_ratio_value(v: Optional[float], unit: str) -> str:
     if v is None:
         return "n/a"
-    return f"{v * 100:.1f}%" if unit == "pct" else f"{v:.1f} days"
+    if unit == "pct":
+        return f"{v * 100:.1f}%"
+    if unit == "x":
+        return f"{v:.2f}x"
+    return f"{v:.1f} days"
 
 
 def _fmt_checks(checks: list) -> str:
@@ -181,8 +219,12 @@ def _fmt_ratios(ratios: list) -> str:
         delta = r.get("delta")
         delta_txt = ""
         if delta is not None:
-            delta_txt = f" ({'+' if delta >= 0 else ''}{delta * 100:.1f}pp)" if unit == "pct" \
-                else f" ({delta:+.1f} days)"
+            if unit == "pct":
+                delta_txt = f" ({'+' if delta >= 0 else ''}{delta * 100:.1f}pp)"
+            elif unit == "x":
+                delta_txt = f" ({delta:+.2f}x)"
+            else:
+                delta_txt = f" ({delta:+.1f} days)"
         lines.append(
             f"- {r['label']}: prior {_fmt_ratio_value(r.get('prior'), unit)} -> "
             f"current {_fmt_ratio_value(r.get('current'), unit)}{delta_txt} [{r['basis']}]"
@@ -213,11 +255,48 @@ def _result(
     }
 
 
+def _coverage_warning(values: list, mapping: dict) -> str:
+    """Deterministic coverage note: rows beyond the last mapped line item that
+    still hold figures in the mapped year columns. Arithmetic can detect the
+    gap but not judge it — it may be a genuine extraction failure (statement
+    cut short) or a correctly excluded derived block (e.g. a %-change view
+    stacked under the statement). So the note states the fact neutrally and
+    leaves the judgement to the user; what it must never do is stay silent.
+    Returns "" when coverage looks complete."""
+    items = (mapping or {}).get("line_items") or []
+    cols = [c for c in (mapping.get("current_col"), mapping.get("prior_col"))
+            if isinstance(c, int) and c >= 0]
+    if not items or not cols:
+        return ""
+    mapped_rows = [it.get("row") for it in items if isinstance(it.get("row"), int)]
+    if not mapped_rows:
+        return ""
+    last_mapped = max(mapped_rows)
+    last_numeric = -1
+    for i, row in enumerate(values or []):
+        for c in cols:
+            if c < len(row) and isinstance(row[c], (int, float)) and not isinstance(row[c], bool):
+                last_numeric = i
+                break
+    # A couple of trailing figure rows (a check figure, a footnote total) is
+    # normal; a longer unmapped tail means the statement was cut short.
+    if last_numeric - last_mapped <= 2:
+        return ""
+    return (
+        f"Rows below used-range row {last_mapped + 1} still hold figures (down to "
+        f"row {last_numeric + 1} of {len(values)}) but were not treated as line items. "
+        f"If they are part of the statement, check the sheet layout; if they are a "
+        f"derived block (e.g. a percentage-change or ratio view), this is expected."
+    )
+
+
 def _statement_entry(role: str, stmt: dict, computed: Optional[dict] = None,
-                     error: str = "") -> dict:
+                     error: str = "", warning: str = "") -> dict:
     """One entry of the result's `statements` list. `computed` is a
     compute_variance result; `error` marks a degraded statement (Pass A failed,
-    empty sheet) — the entry still appears so the UI can say what happened."""
+    empty sheet) — the entry still appears so the UI can say what happened.
+    `warning` flags a statement that DID compute but with suspect coverage
+    (see _coverage_warning); it rides the entry into both the UI and audit."""
     entry = {
         "role": role,
         "sheet": stmt.get("sheet", ""),
@@ -231,6 +310,8 @@ def _statement_entry(role: str, stmt: dict, computed: Optional[dict] = None,
     }
     if error:
         entry["error"] = error
+    if warning:
+        entry["warning"] = warning
     return entry
 
 
@@ -241,14 +322,14 @@ async def analyse_variance(
     model: str = DEFAULT_MODEL,
     clearly_trivial: float = 0.0,
 ) -> dict:
-    """Year-over-year variance analysis over one or two financial statements.
+    """Year-over-year variance analysis over one to three financial statements.
 
-    `statements` = [{role: "IS"|"BS", values, address, sheet}, ...] (worksheet
-    used ranges; size-capped by the orchestrator before they get here). One
-    statement → single-statement analysis; IS + BS → adds tie-out checks and
-    the deterministic cross-statement ratio layer. `contract_md` = the
+    `statements` = [{role: "IS"|"BS"|"CF", values, address, sheet}, ...]
+    (worksheet used ranges; size-capped by the orchestrator before they get
+    here). Any subset works; each additional statement unlocks the tie-out
+    checks and cross-statement ratios that need it. `contract_md` = the
     variance_analysis.md contract, injected by main.py from excelcat-skills.
-    `clearly_trivial` = absolute materiality threshold, shared across both
+    `clearly_trivial` = absolute materiality threshold, shared across all
     statements; it is also the tolerance for the tie-out checks. Returns
     {clearly_trivial, statements, checks, ratios, anomalies, cfo_questions,
     summary}. Pure compute + LLM, NO audit, no print().
@@ -270,7 +351,7 @@ async def analyse_variance(
         return _result("No statement supplied.", clearly_trivial=threshold)
 
     # ── Pass A per statement, concurrently (structure only, no figures) ──
-    roles_order = [r for r in ("IS", "BS") if r in by_role]
+    roles_order = [r for r in ("IS", "BS", "CF") if r in by_role]
     locates = await asyncio.gather(*[
         _locate_structure(
             r,
@@ -300,25 +381,21 @@ async def analyse_variance(
             continue
         comp = compute_variance(mapping, stmt["values"], threshold)
         computed[role] = (mapping, comp)
-        entries.append(_statement_entry(role, stmt, computed=comp))
+        entries.append(_statement_entry(
+            role, stmt, computed=comp,
+            warning=_coverage_warning(stmt["values"], mapping),
+        ))
 
-    is_ok = "IS" in computed
-    bs_ok = "BS" in computed
-
-    checks: list = []
-    if bs_ok:
-        checks = check_ties(
-            computed["BS"][0], by_role["BS"]["values"], threshold,
-            is_mapping=computed["IS"][0] if is_ok else None,
-            is_grid=by_role["IS"]["values"] if is_ok else None,
-        )
-
-    ratios: list = []
-    if is_ok and bs_ok:
-        ratios = compute_ratios(
-            computed["IS"][0], by_role["IS"]["values"],
-            computed["BS"][0], by_role["BS"]["values"],
-        )
+    # Checks and ratios take the same {role: (mapping, grid)} view of whatever
+    # located successfully; each module decides internally what its statements
+    # allow (run_checks returns [] without a BS or CF, compute_ratios omits
+    # ratios whose statements aren't all present).
+    located = {
+        role: (mapping, by_role[role]["values"])
+        for role, (mapping, _comp) in computed.items()
+    }
+    checks = run_checks(located, threshold)
+    ratios = compute_ratios(located)
 
     all_rows = [r for _, comp in computed.values() for r in comp.get("rows", [])]
     if not all_rows:
@@ -397,7 +474,7 @@ Return STRICT JSON only, exactly this shape:
   "anomalies": [{{"title": "<short>", "detail": "<1-2 sentences>", "lines": ["<line item>"]}}],
   "cfo_questions": ["<question>"]}}"""
 
-    raw_b = (await _call_model(model, pass_b_prompt))["text"]
+    raw_b = (await _call_model(model, pass_b_prompt, timeout_s=VARIANCE_CALL_TIMEOUT_S))["text"]
     analysis = _parse_json(raw_b) or {}
 
     return _result(
@@ -412,6 +489,119 @@ Return STRICT JSON only, exactly this shape:
 async def _noop() -> None:
     """Placeholder awaitable for statements with no values (keeps gather zip-aligned)."""
     return None
+
+
+# ── DCF Pass A: multi-year structure (variance's Pass A locates only two
+# columns; a DCF needs the whole historical series). Same invariant: the LLM
+# returns ONLY structure — row/column indices and labels — never a figure.
+# `change_in_nwc` is a DCF-only CF role: the working-capital movement line
+# ("Changes in operating assets and liabilities") feeds ΔNWC directly, which
+# the variance vocabulary has no use for.
+_DCF_ROLES = {
+    "IS": IS_ROLES,
+    "BS": BS_ROLES,
+    "CF": CF_ROLES.replace("capex,", "capex, change_in_nwc,"),
+}
+
+_DCF_ROLE_HINTS = {
+    "IS": "Revenue/Sales, Operating income (EBIT), Tax expense, Depreciation & amortisation",
+    "BS": "Cash, Receivables, Inventory, Payables, Debt",
+    "CF": ("Depreciation & amortisation add-back, Capital expenditure, and the "
+           "working-capital movement line (e.g. 'Changes in operating assets and "
+           "liabilities') — role change_in_nwc"),
+}
+
+
+async def _locate_multi_year_structure(role: str, values: list, address: str, model: str) -> Optional[dict]:
+    """DCF Pass A for one statement: all HISTORICAL year columns + role-tagged rows."""
+    kind = _STATEMENT_KINDS[role]
+    n_rows = len(values)
+    grid_json = json.dumps(values, default=str)
+    prompt = f"""You are a financial-statement structure parser. You are given the
+used range of a {kind['name']} worksheet as a 2D array (row-major, 0-based indices).
+
+Identify:
+- year_cols: the 0-based COLUMN indices of every HISTORICAL (actual) annual period,
+  in chronological order. EXCLUDE forecast/estimate columns — labels marked E,
+  Est, F, or otherwise flagged as projections (e.g. "CY '22E") are NOT historical.
+  Ignore %-change columns, variance columns, and notes.
+- year_labels: the period label for each of those columns, same order (e.g. "CY '17").
+- line_items: the rows that are {kind['items_hint']}. For each, give its label text,
+  its 0-based row index, and its semantic role. The rows that matter most here:
+  {_DCF_ROLE_HINTS[role]}.
+
+Roles: assign each line item exactly one role from this list (use "other" when
+none fits — do NOT invent new role names):
+{_DCF_ROLES[role]}
+
+Rules:
+- The grid has {n_rows} rows (indices 0 to {n_rows - 1}). Work through EVERY row.
+- When the SAME economic line appears both gross and net, assign the semantic role
+  to the NET line and give the gross line the role "other".
+- Return STRICT JSON only, no prose, exactly this shape:
+{{"year_cols": [<int>], "year_labels": ["<str>"],
+  "line_items": [{{"label": "<str>", "row": <int>, "role": "<str>"}}]}}
+
+Worksheet address: {address}
+Grid (2D array):
+{grid_json}"""
+    raw = (await _call_model(model, prompt, timeout_s=VARIANCE_CALL_TIMEOUT_S))["text"]
+    mapping = _parse_json(raw)
+    if not mapping or not mapping.get("line_items") or not mapping.get("year_cols"):
+        return None
+    return mapping
+
+
+@mcp.tool()
+async def derive_fcf_drivers(
+    statements: List[dict],
+    model: str = DEFAULT_MODEL,
+) -> dict:
+    """Historical FCF-driver derivation for the DCF feature.
+
+    `statements` = [{role: "IS"|"BS"|"CF", values, address, sheet}, ...]
+    (worksheet used ranges; size-capped and minimum-history-validated by the
+    orchestrator). Runs the multi-year Pass A per statement concurrently, then
+    the deterministic driver layer (backend/dcf.py) on the real grids.
+
+    Returns {years, series, drivers, cash, debt, provenance, warnings,
+    mappings} — `mappings` (role → Pass A structure) rides along so the
+    orchestrator can verify declared provenance against the source grids
+    deterministically. On failure returns {error, warnings}. Pure compute +
+    LLM, NO audit, no print().
+    """
+    by_role: dict = {}
+    for stmt in statements or []:
+        role = str((stmt or {}).get("role", "")).upper()
+        if role in _STATEMENT_KINDS and role not in by_role:
+            by_role[role] = stmt
+
+    if "IS" not in by_role or "CF" not in by_role:
+        return {"error": "DCF derivation needs both an Income Statement and a Cash Flow statement.",
+                "warnings": []}
+
+    roles_order = [r for r in ("IS", "BS", "CF") if r in by_role]
+    locates = await asyncio.gather(*[
+        _locate_multi_year_structure(
+            r, by_role[r].get("values") or [], by_role[r].get("address", ""), model,
+        ) if by_role[r].get("values") else _noop()
+        for r in roles_order
+    ])
+    mappings = {r: m for r, m in zip(roles_order, locates) if m}
+
+    missing = [r for r in ("IS", "CF") if r not in mappings]
+    if missing:
+        return {"error": f"Could not interpret the {' and '.join(missing)} layout — "
+                         f"check that the sheet has labelled line items and year columns.",
+                "warnings": []}
+
+    result = _derive_fcf_drivers(
+        mappings,
+        {r: by_role[r].get("values") or [] for r in mappings},
+        {r: by_role[r].get("sheet", "") for r in mappings},
+    )
+    result["mappings"] = mappings
+    return result
 
 
 if __name__ == "__main__":

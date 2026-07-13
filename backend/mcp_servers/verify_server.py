@@ -177,8 +177,13 @@ def check_rules(tool_call: dict, context: Optional[dict] = None) -> dict:
     name = tool_call.get("name", "")
     for rule in RULES:
         if rule.applies_to(name):
+            # Record every applicable rule, not just ones that yield results —
+            # otherwise "checked, clean" and "never evaluated" look identical
+            # in the audit trail, which breaks the repeatability claim.
+            checks_run.append(rule.id)
             for r in rule.check(tool_call, ctx):
-                checks_run.append(r.rule_id)
+                if r.rule_id != rule.id:
+                    checks_run.append(r.rule_id)
                 if r.level == "warning":
                     warnings.append(r.message)
                 elif r.level == "suggestion":
@@ -188,6 +193,10 @@ def check_rules(tool_call: dict, context: Optional[dict] = None) -> dict:
                         "suggested": "",
                         "reason": r.message,
                     })
+
+    # Dedupe (order-preserving): a rule firing multiple results, or emitting a
+    # proof-of-work info result, would otherwise list its id twice.
+    checks_run = list(dict.fromkeys(checks_run))
 
     return {"warnings": warnings, "suggestions": suggestions, "checks_run": checks_run}
 

@@ -39,7 +39,9 @@ class OverwriteReferencedCellRule(Rule):
     level = "warning"
 
     def applies_to(self, tool_name: str) -> bool:
-        return tool_name in ("write_to_cell", "apply_formula_pattern")
+        # apply_cleaning overwrites existing values, so a fix that breaks a
+        # dependent formula (e.g. a VLOOKUP key) is exactly what this catches.
+        return tool_name in ("write_to_cell", "apply_formula_pattern", "apply_cleaning")
 
     def check(self, tool_call: dict, context: Any) -> List[RuleResult]:
         if context is None:
@@ -57,8 +59,8 @@ class OverwriteReferencedCellRule(Rule):
 
         if name == "write_to_cell":
             targets = {args.get("cell", "").strip().upper()}
-        elif name == "apply_formula_pattern":
-            targets = {c.strip().upper() for c in args.get("cells", [])}
+        elif name in ("apply_formula_pattern", "apply_cleaning"):
+            targets = {str(c).strip().upper() for c in args.get("cells", [])}
         else:
             return []
 

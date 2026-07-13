@@ -1,13 +1,26 @@
 """
-Balance-sheet tie-out checks.
+Statement tie-out checks (Balance Sheet + Cash Flow).
 
-Pure compute — no LLM, no audit, no Excel. Given the BS structure mapping from
-Pass A (which now tags line items with semantic roles) and the raw grid, this
-verifies the accounting identities the statement MUST satisfy:
+Pure compute — no LLM, no audit, no Excel. Given the structure mappings from
+Pass A (which tags line items with semantic roles) and the raw grids, this
+verifies the accounting identities the statements MUST satisfy:
 
-  balance          — Total assets = Total liabilities + Total equity (each year)
-  re_rollforward   — Closing retained earnings = opening RE + net income − dividends
-                     (needs the Income Statement's net income; cross-statement)
+  Balance Sheet
+    balance          — Total assets = Total liabilities + Total equity (each year)
+    re_rollforward   — Closing retained earnings = opening RE + net income − dividends
+                       (needs the Income Statement's net income; cross-statement)
+  Cash Flow
+    cash_rollforward — Opening cash + net change in cash = closing cash (each year)
+    cf_sections_sum  — Operating + investing + financing flows = net change in cash
+                       (each year)
+    cash_ties_to_bs  — CF closing cash = the Balance Sheet's cash, both years
+                       (cross-statement — the strongest proof that two
+                       independently prepared statements describe the same books)
+
+Net income vs operating cash flow is deliberately NOT a check: whether earnings
+convert to cash is a judgement, so it lives in the ratio layer (cash conversion)
+and the contract's relationship pairs. Checks are proofs; anomalies are
+judgements.
 
 Unlike Find Outliers (an LLM judgement about values that *look* unusual), these
 are arithmetic proofs with a residual: they either hold within tolerance or they
@@ -17,6 +30,9 @@ with the pre_write_hook philosophy of informing the user, not overriding them.
 
 Tolerance is the user's clearly-trivial threshold: "out of balance by more than
 your own materiality level" is what counts as a fail.
+
+`run_checks` is the single entry point: give it whichever statements the run
+located and it fans out to the checks those statements allow.
 """
 from typing import Any, List, Optional
 
@@ -54,6 +70,30 @@ def _within(residual: float, lhs: float, rhs: float, tolerance: float) -> bool:
     # arrive as floats from Office.js), never rounding done in the sheet itself.
     noise = 1e-9 * max(abs(lhs), abs(rhs), 1.0)
     return abs(residual) <= max(tolerance, noise)
+
+
+def run_checks(stmts: dict, tolerance: float = 0.0) -> List[dict]:
+    """Single entry point: run every tie-out check the supplied statements allow.
+
+    `stmts` maps statement role → (mapping, grid) for each statement whose
+    Pass A mapping succeeded — any subset of {"IS", "BS", "CF"}. BS checks run
+    when the BS is present, CF checks when the CF is present; the
+    cross-statement legs (RE roll-forward needs the IS, the cash tie needs the
+    BS) degrade to "skipped" with the reason when the counterpart is missing.
+    The IS alone has no internal identity to prove, so IS-only runs return [].
+    """
+    is_mapping, is_grid = stmts.get("IS") or (None, None)
+    bs_mapping, bs_grid = stmts.get("BS") or (None, None)
+    cf_mapping, cf_grid = stmts.get("CF") or (None, None)
+
+    checks: List[dict] = []
+    if bs_mapping is not None:
+        checks.extend(check_ties(bs_mapping, bs_grid, tolerance,
+                                 is_mapping=is_mapping, is_grid=is_grid))
+    if cf_mapping is not None:
+        checks.extend(check_cash_flow(cf_mapping, cf_grid, tolerance,
+                                      bs_mapping=bs_mapping, bs_grid=bs_grid))
+    return checks
 
 
 def check_ties(
@@ -223,4 +263,190 @@ def check_ties(
         ),
         "cells": cells,
     })
+    return checks
+
+
+def check_cash_flow(
+    cf_mapping: dict,
+    cf_grid: List[List[Any]],
+    tolerance: float = 0.0,
+    bs_mapping: Optional[dict] = None,
+    bs_grid: Optional[List[List[Any]]] = None,
+) -> List[dict]:
+    """Run the cash-flow tie-out checks. Same result shape and status semantics
+    as check_ties. All three are identities on rows the Cash Flow statement
+    itself claims to reconcile — a fail means the statement does not even agree
+    with itself (or, for the cash tie, with the Balance Sheet).
+    """
+    checks: List[dict] = []
+    roles = _role_rows(cf_mapping)
+    try:
+        cc = int(cf_mapping.get("current_col"))
+        pc = int(cf_mapping.get("prior_col"))
+    except (TypeError, ValueError):
+        return [{
+            "id": "cash_rollforward", "label": "Cash roll-forward",
+            "status": "skipped",
+            "detail": "Cash Flow structure mapping has no valid year columns.",
+            "cells": {},
+        }]
+    cur_label = str(cf_mapping.get("current_label", "") or "current year")
+    pri_label = str(cf_mapping.get("prior_label", "") or "prior year")
+    years = ((pc, pri_label), (cc, cur_label))
+
+    open_row = roles.get("opening_cash")
+    close_row = roles.get("closing_cash")
+    change_row = roles.get("net_change_in_cash")
+
+    # ── Check 1: cash_rollforward — opening cash + net change = closing cash ──
+    missing = [name for name, r in (("opening cash", open_row),
+                                    ("net change in cash", change_row),
+                                    ("closing cash", close_row)) if r is None]
+    if missing:
+        checks.append({
+            "id": "cash_rollforward", "label": "Cash roll-forward",
+            "status": "skipped",
+            "detail": f"Could not locate the {', '.join(missing)} row(s) on the Cash Flow statement.",
+            "cells": {},
+        })
+    else:
+        cells = {"opening_cash": {"row": open_row},
+                 "net_change_in_cash": {"row": change_row},
+                 "closing_cash": {"row": close_row}}
+        for col, year in years:
+            opening = _cell(cf_grid, open_row, col)
+            change = _cell(cf_grid, change_row, col)
+            closing = _cell(cf_grid, close_row, col)
+            if opening is None or change is None or closing is None:
+                checks.append({
+                    "id": "cash_rollforward", "label": f"Cash roll-forward ({year})",
+                    "status": "skipped",
+                    "detail": f"{year}: non-numeric value in an opening / net-change / closing cash row.",
+                    "cells": cells,
+                })
+                continue
+            expected = opening + change
+            residual = closing - expected
+            ok = _within(residual, closing, expected, tolerance)
+            checks.append({
+                "id": "cash_rollforward", "label": f"Cash roll-forward ({year})",
+                "status": "pass" if ok else "fail",
+                "detail": (
+                    f"{year}: opening cash {opening:,.0f} + net change {change:+,.0f} "
+                    f"vs closing cash {closing:,.0f}"
+                    + (" — ties." if ok else f" — off by {residual:+,.0f}.")
+                ),
+                "cells": cells,
+            })
+
+    # ── Check 2: cf_sections_sum — OCF + ICF + FCF = net change in cash ──
+    ocf_row = roles.get("operating_cash_flow")
+    icf_row = roles.get("investing_cash_flow")
+    fcf_row = roles.get("financing_cash_flow")
+    missing = [name for name, r in (("operating", ocf_row),
+                                    ("investing", icf_row),
+                                    ("financing", fcf_row)) if r is None]
+    if change_row is None:
+        missing.append("net change in cash")
+    if missing:
+        checks.append({
+            "id": "cf_sections_sum", "label": "Sections sum to net change in cash",
+            "status": "skipped",
+            "detail": f"Could not locate the {', '.join(missing)} row(s) on the Cash Flow statement.",
+            "cells": {},
+        })
+    else:
+        cells = {"operating_cash_flow": {"row": ocf_row},
+                 "investing_cash_flow": {"row": icf_row},
+                 "financing_cash_flow": {"row": fcf_row},
+                 "net_change_in_cash": {"row": change_row}}
+        for col, year in years:
+            ocf = _cell(cf_grid, ocf_row, col)
+            icf = _cell(cf_grid, icf_row, col)
+            fcf = _cell(cf_grid, fcf_row, col)
+            change = _cell(cf_grid, change_row, col)
+            if ocf is None or icf is None or fcf is None or change is None:
+                checks.append({
+                    "id": "cf_sections_sum",
+                    "label": f"Sections sum to net change in cash ({year})",
+                    "status": "skipped",
+                    "detail": f"{year}: non-numeric value in a section total or the net-change row.",
+                    "cells": cells,
+                })
+                continue
+            total = ocf + icf + fcf
+            residual = total - change
+            ok = _within(residual, total, change, tolerance)
+            checks.append({
+                "id": "cf_sections_sum",
+                "label": f"Sections sum to net change in cash ({year})",
+                "status": "pass" if ok else "fail",
+                "detail": (
+                    f"{year}: operating {ocf:+,.0f} + investing {icf:+,.0f} + financing "
+                    f"{fcf:+,.0f} = {total:+,.0f} vs net change {change:+,.0f}"
+                    + (" — ties." if ok else f" — off by {residual:+,.0f}.")
+                ),
+                "cells": cells,
+            })
+
+    # ── Check 3: cash_ties_to_bs — CF closing cash = BS cash, both years ──
+    # The strongest cross-statement proof available: two independently prepared
+    # statements claiming the same closing balance, verified for BOTH years.
+    label = "Closing cash ties to Balance Sheet"
+    if close_row is None:
+        checks.append({
+            "id": "cash_ties_to_bs", "label": label, "status": "skipped",
+            "detail": "Could not locate a closing cash row on the Cash Flow statement.",
+            "cells": {},
+        })
+        return checks
+    if not bs_mapping or bs_grid is None:
+        checks.append({
+            "id": "cash_ties_to_bs", "label": label, "status": "skipped",
+            "detail": "Needs the Balance Sheet (cash line) — not available in this run.",
+            "cells": {"closing_cash": {"row": close_row}},
+        })
+        return checks
+
+    bs_roles = _role_rows(bs_mapping)
+    bs_cash_row = bs_roles.get("cash")
+    try:
+        bs_cc = int(bs_mapping.get("current_col"))
+        bs_pc = int(bs_mapping.get("prior_col"))
+    except (TypeError, ValueError):
+        bs_cc = bs_pc = None
+    if bs_cash_row is None or bs_cc is None:
+        checks.append({
+            "id": "cash_ties_to_bs", "label": label, "status": "skipped",
+            "detail": ("Could not locate a Cash row on the Balance Sheet."
+                       if bs_cash_row is None else
+                       "Balance Sheet structure mapping has no valid year columns."),
+            "cells": {"closing_cash": {"row": close_row}},
+        })
+        return checks
+
+    cells = {"closing_cash": {"row": close_row},
+             "cash": {"row": bs_cash_row, "statement": "BS"}}
+    for cf_col, bs_col, year in ((pc, bs_pc, pri_label), (cc, bs_cc, cur_label)):
+        cf_cash = _cell(cf_grid, close_row, cf_col)
+        bs_cash = _cell(bs_grid, bs_cash_row, bs_col)
+        if cf_cash is None or bs_cash is None:
+            checks.append({
+                "id": "cash_ties_to_bs", "label": f"{label} ({year})",
+                "status": "skipped",
+                "detail": f"{year}: closing cash (CF) or cash (BS) not readable as a number.",
+                "cells": cells,
+            })
+            continue
+        residual = cf_cash - bs_cash
+        ok = _within(residual, cf_cash, bs_cash, tolerance)
+        checks.append({
+            "id": "cash_ties_to_bs", "label": f"{label} ({year})",
+            "status": "pass" if ok else "fail",
+            "detail": (
+                f"{year}: closing cash {cf_cash:,.0f} (CF) vs cash {bs_cash:,.0f} (BS)"
+                + (" — ties." if ok else f" — differs by {residual:+,.0f}.")
+            ),
+            "cells": cells,
+        })
     return checks

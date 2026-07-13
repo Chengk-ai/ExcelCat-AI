@@ -6,7 +6,10 @@ from .email_format_check import EmailFormatCheckRule
 from .percentage_range_check import PercentageRangeCheckRule
 from .forecast_sanity import ForecastSanityRule
 from .forecast_integrity import ForecastIntegrityRule
+from .clean_integrity import CleanIntegrityRule
 from .financial import (
+    DcfSanityRule,
+    DcfIntegrityRule,
     TgrVsWaccRule,
     WaccRangeRule,
     WaccHardcodedRule,
@@ -33,6 +36,14 @@ RULES = [
     # Type 4: forecast declared-vs-actual integrity (history provenance,
     # rate reconciliation, method guardrail)
     ForecastIntegrityRule(),
+    # Type 5: cleaning declared-vs-actual integrity (old-value provenance,
+    # transform correctness) — apply_cleaning only
+    CleanIntegrityRule(),
+    # Type 6: DCF — numeric sanity on the declared assumptions, and
+    # declared-vs-actual integrity of the emitted two-sheet template
+    # (apply_dcf_template only)
+    DcfSanityRule(),
+    DcfIntegrityRule(),
 ]
 
 RULES_REVIEW = [
