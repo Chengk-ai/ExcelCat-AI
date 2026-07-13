@@ -16,6 +16,7 @@ human-readable MD view. The JSONL is the source of truth.
 from __future__ import annotations
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -69,12 +70,27 @@ def append_event(
 
 def clear() -> bool:
     """
-    Delete audit.jsonl and the rendered audit.md, if present.
+    Delete audit.jsonl and the rendered audit.md, if present, then start the
+    new log with an `audit_cleared` event as its first line.
+
+    The marker makes a wipe distinguishable from a log that never existed:
+    an auditor reading a fresh file that *begins* with audit_cleared knows
+    history was removed deliberately (and how many events), rather than
+    wondering whether the trail was tampered with. It is only written when
+    something was actually removed, so a user who never opted into audit
+    still gets no file created.
+
     Returns True if at least one file was removed, False otherwise.
     Never throws.
     """
     removed = False
+    events_removed = 0
     md_file = os.path.join(os.path.dirname(__file__), "audit.md")
+    try:
+        with open(AUDIT_FILE, "r", encoding="utf-8") as f:
+            events_removed = sum(1 for line in f if line.strip())
+    except Exception:
+        pass
     for path in (AUDIT_FILE, md_file):
         try:
             if os.path.exists(path):
@@ -82,4 +98,12 @@ def clear() -> bool:
                 removed = True
         except Exception:
             pass
+    if removed:
+        # Deletion and the first-line marker live in the same function so no
+        # caller can end up with a fresh log that lacks the marker.
+        append_event(
+            "audit_cleared",
+            {"events_removed": events_removed},
+            request_id=str(uuid.uuid4()),
+        )
     return removed

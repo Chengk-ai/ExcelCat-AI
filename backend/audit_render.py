@@ -68,8 +68,9 @@ def _render(events: list[dict]) -> str:
     parts.append(f"_Generated {now} · {len(events)} events_")
     parts.append("")
     parts.append(
-        "Each section below corresponds to one `/chat` request. Events are "
-        "ordered as they happened. Click **raw** to see the underlying JSON."
+        "Each section below covers one request — a chat round, a review, or "
+        "a variance or DCF run. Events are ordered as they happened. Click "
+        "**raw** to see the underlying JSON."
     )
     parts.append("")
 
@@ -141,6 +142,27 @@ def _render_event(e: dict) -> str:
 
     parts = [f"### {ts} — {heading_label}", "", body, "", raw_block]
     return "\n".join(parts)
+
+
+def _fmt_ratio_value(v, unit: str) -> str:
+    """Format a variance ratio value by unit — same convention as the
+    analysis server's own formatter (pct / x / days), so audit.md and the
+    task pane never disagree about what a number means."""
+    if v is None:
+        return "n/a"
+    if unit == "pct":
+        return f"{v * 100:.1f}%"
+    if unit == "x":
+        return f"{v:.2f}x"
+    return f"{v:.1f} days"
+
+
+def _fmt_addresses(addrs: list) -> str:
+    """Render [{role, sheet, address}] as 'IS `Sheet1!A1:D20`, …'."""
+    return ", ".join(
+        f"{a.get('role', '?')} `{a.get('sheet', '')}!{a.get('address', '')}`"
+        for a in addrs
+    )
 
 
 def _summarise(event_type: str, p: dict) -> tuple[str, str]:
@@ -263,6 +285,140 @@ def _summarise(event_type: str, p: dict) -> tuple[str, str]:
         if reason:
             body += f"\n\n_Reason_: {reason}"
         return (f"User decision ({decision})", body)
+
+    if event_type == "review_run":
+        results = p.get("results") or []
+        n_warn = sum(1 for r in results if r.get("level") == "warning")
+        n_sugg = sum(1 for r in results if r.get("level") == "suggestion")
+        first = f"**Review** of `{p.get('address', '?')}`"
+        if p.get("error"):
+            first += " · ⚠️ verification service unavailable"
+        body_lines = [first]
+        located = p.get("located") or {}
+        if located:
+            body_lines += ["", "**Assumptions located**:"]
+            for label, entries in located.items():
+                vals = ", ".join(
+                    f"`{e.get('value', '?')}`"
+                    + (f" at `{e['cell']}`" if e.get("cell") else "")
+                    + (" (hardcoded)" if e.get("hardcoded") else "")
+                    for e in entries
+                )
+                body_lines.append(f"- {label}: {vals}")
+        if results:
+            body_lines += ["", "**Findings**:"]
+            for r in results:
+                glyph = "⚠️" if r.get("level") == "warning" else "💡"
+                body_lines.append(
+                    f"- {glyph} `{r.get('rule_id', '?')}`: {r.get('message', '')}"
+                )
+        if p.get("summary"):
+            body_lines += ["", f"_{p['summary']}_"]
+        if not results:
+            heading = "Review (no findings)"
+        else:
+            parts = []
+            if n_warn:
+                parts.append(f"{n_warn} warning{'s' if n_warn != 1 else ''}")
+            if n_sugg:
+                parts.append(f"{n_sugg} suggestion{'s' if n_sugg != 1 else ''}")
+            heading = f"Review ({', '.join(parts)})"
+        return (heading, "\n".join(body_lines))
+
+    if event_type == "variance_run":
+        checks = p.get("checks") or []
+        n_flag = sum(1 for c in checks if c.get("status") != "ok")
+        first = f"**Variance analysis** · model: `{p.get('model', '?')}`"
+        if p.get("error"):
+            first += " · ⚠️ degraded"
+        body_lines = [first]
+        addr_txt = _fmt_addresses(p.get("addresses") or [])
+        if addr_txt:
+            body_lines += ["", f"**Statements**: {addr_txt}"]
+        if checks:
+            body_lines += ["", "**Tie-out checks**:"]
+            for c in checks:
+                glyph = "✓" if c.get("status") == "ok" else "⚠️"
+                body_lines.append(f"- {glyph} {c.get('label', '?')}: {c.get('detail', '')}")
+        ratios = p.get("ratios") or []
+        if ratios:
+            body_lines += ["", "**Ratios**:"]
+            for r in ratios:
+                if r.get("status") != "ok":
+                    body_lines.append(
+                        f"- (skipped) {r.get('label', '?')}: {r.get('reason', '')}"
+                    )
+                    continue
+                unit = r.get("unit", "")
+                body_lines.append(
+                    f"- {r.get('label', '?')}: "
+                    f"{_fmt_ratio_value(r.get('prior'), unit)} → "
+                    f"{_fmt_ratio_value(r.get('current'), unit)} [{r.get('basis', '')}]"
+                )
+        anomalies = p.get("anomalies") or []
+        questions = p.get("cfo_questions") or []
+        if anomalies or questions:
+            body_lines += [
+                "",
+                f"**LLM narrative**: anomalies: {len(anomalies)}, "
+                f"CFO questions: {len(questions)} — full text in raw.",
+            ]
+        if p.get("summary"):
+            body_lines += ["", f"_{p['summary']}_"]
+        if not checks:
+            heading = "Variance run"
+        elif n_flag:
+            heading = f"Variance run ({n_flag} check{'s' if n_flag != 1 else ''} flagged)"
+        else:
+            heading = "Variance run (ties clean)"
+        return (heading, "\n".join(body_lines))
+
+    if event_type == "dcf_run":
+        first = (
+            f"**DCF run** · model: `{p.get('model', '?')}` · "
+            f"{p.get('forecast_years', '?')} forecast year(s)"
+        )
+        if p.get("error"):
+            first += " · ⚠️ refused/degraded"
+        body_lines = [first]
+        addr_txt = _fmt_addresses(p.get("addresses") or [])
+        if addr_txt:
+            body_lines += ["", f"**Statements**: {addr_txt}"]
+        inputs = {
+            k: v for k, v in (p.get("user_inputs") or {}).items() if v not in (None, "")
+        }
+        if inputs:
+            body_lines += [
+                "",
+                f"**User inputs**: `{json.dumps(inputs, ensure_ascii=False, default=str)}`",
+            ]
+        derived = p.get("derived") or {}
+        if derived:
+            years = derived.get("years") or []
+            span = f" ({years[0]}–{years[-1]})" if years else ""
+            body_lines += ["", f"**Derived historicals**: {len(years)} year(s){span}"]
+            drivers = derived.get("drivers") or {}
+            names = ", ".join(f"`{k}`" for k, v in drivers.items() if v)
+            if names:
+                body_lines.append(f"**Drivers**: {names}")
+            for w in derived.get("warnings") or []:
+                body_lines.append(f"- ⚠️ {w}")
+        tcs = p.get("tool_calls_proposed") or []
+        if tcs:
+            names = ", ".join(f"`{t.get('name', '?')}`" for t in tcs)
+            body_lines += ["", f"**Proposed**: {len(tcs)} tool call(s) — {names}"]
+        excerpt = p.get("reply_excerpt") or ""
+        if excerpt:
+            body_lines += ["", "```", excerpt, "```"]
+        return ("DCF run", "\n".join(body_lines))
+
+    if event_type == "audit_cleared":
+        n = p.get("events_removed", "?")
+        body = (
+            f"**Audit history cleared** — {n} earlier event(s) deleted by the user. "
+            "This marker opens the current log; nothing before its timestamp survives."
+        )
+        return ("Audit cleared", body)
 
     # Unknown event — fall back to a generic dump.
     return (event_type, f"_(unrecognised event type: {event_type})_")
