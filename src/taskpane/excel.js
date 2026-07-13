@@ -4,23 +4,57 @@
 import { state, selPill, selLabel } from './core';
 
 // ── Selection tracking ─────────────────────────────────
+// Cap on cells whose values/formulas ride along as chat context. Above this,
+// loading the payload can freeze the webview, and the whole context is
+// re-sent in every subsequent /chat body. Whole-column/row clicks are first
+// clipped to the used range, so the cap only bites on genuinely huge data
+// selections — those keep address/dimensions but drop values (values: []
+// keeps the payload compatible with the backend's SelectionContext schema).
+const MAX_CONTEXT_CELLS = 20000;
+
+// Reads are async and can finish out of order — an older (bigger, slower)
+// selection must not overwrite a newer one. Only the latest call commits.
+let selectionSeq = 0;
+
 export async function refreshSelection() {
+  const seq = ++selectionSeq;
   try {
     await Excel.run(async ctx => {
-      const range = ctx.workbook.getSelectedRange();
-      range.load(['address', 'values', 'formulas', 'rowCount', 'columnCount', 'worksheet/name']);
+      let range = ctx.workbook.getSelectedRange();
+      range.load(['address', 'rowCount', 'columnCount', 'worksheet/name']);
       await ctx.sync();
 
-      const addr     = range.address.includes('!') ? range.address.split('!')[1] : range.address;
-      const sheet    = range.worksheet.name;
-      const rows     = range.rowCount;
-      const cols     = range.columnCount;
-      const values   = range.values;
-      const formulas = range.formulas;
+      const sheet = range.worksheet.name;
 
-      state.selectionContext = { address: addr, sheet, values, formulas, rowCount: rows, columnCount: cols };
+      // A column-header click "selects" a million rows; the data the user
+      // means is the intersection with the used range.
+      if (range.rowCount * range.columnCount > MAX_CONTEXT_CELLS) {
+        const used = range.worksheet.getUsedRangeOrNullObject(true);
+        const clipped = range.getIntersectionOrNullObject(used);
+        clipped.load(['address', 'rowCount', 'columnCount', 'isNullObject']);
+        await ctx.sync();
+        if (!clipped.isNullObject) range = clipped;
+      }
+
+      const addr = range.address.includes('!') ? range.address.split('!')[1] : range.address;
+      const rows = range.rowCount;
+      const cols = range.columnCount;
+
+      const tooLarge = rows * cols > MAX_CONTEXT_CELLS;
+      let values = [];
+      let formulas = [];
+      if (!tooLarge) {
+        range.load(['values', 'formulas']);
+        await ctx.sync();
+        values = range.values;
+        formulas = range.formulas;
+      }
+
+      if (seq !== selectionSeq) return; // superseded by a newer selection
+
+      state.selectionContext = { address: addr, sheet, values, formulas, rowCount: rows, columnCount: cols, tooLarge };
       if (selPill) {
-        selLabel.textContent = `Selection: ${addr} (${rows}×${cols})`;
+        selLabel.textContent = `Selection: ${addr} (${rows}×${cols})${tooLarge ? ' · too large, values not attached' : ''}`;
         selPill.classList.add('visible');
       }
     });
@@ -36,7 +70,8 @@ export async function refreshSelection() {
 export function selectionContextLabel() {
   const c = state.selectionContext;
   if (!c) return null;
-  return `${c.sheet}!${c.address} · ${c.rowCount}×${c.columnCount}`;
+  return `${c.sheet}!${c.address} · ${c.rowCount}×${c.columnCount}`
+    + (c.tooLarge ? ' · values not attached (too large)' : '');
 }
 
 // Write the Chart Function

@@ -19,6 +19,12 @@ export async function triggerReview() {
     showToast('Select the range that holds your model first, then run Review again.');
     return;
   }
+  // Truncated context carries no values — reviewing it would silently
+  // check nothing and report a clean bill of health.
+  if (state.selectionContext.tooLarge) {
+    showToast('Selection is too large to review — select just the model block and try again.');
+    return;
+  }
   if (state.isTyping) {
     showToast('Hold on — another request is still running.');
     return;

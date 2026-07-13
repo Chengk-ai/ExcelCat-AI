@@ -108,9 +108,15 @@ if (miAuditClear) {
 Office.onReady(info => {
   if (info.host === Office.HostType.Excel) {
     console.log('Office.js ready – Excel');
-    // Auto-refresh selection whenever user changes it
+    // Auto-refresh selection whenever user changes it. Trailing debounce:
+    // drag-selecting fires a burst of events, and each refresh is a full
+    // Excel round-trip — only the settled selection is worth paying for.
+    let selTimer = null;
     Excel.run(async ctx => {
-      ctx.workbook.onSelectionChanged.add(() => { refreshSelection(); });
+      ctx.workbook.onSelectionChanged.add(() => {
+        clearTimeout(selTimer);
+        selTimer = setTimeout(refreshSelection, 200);
+      });
       await ctx.sync();
     }).catch(() => {});
 
